@@ -60,4 +60,5 @@ Copy the contents of `pike13-reports.js` and paste into the browser console on a
 
 | Version | Date | Notes |
 |---|---|---|
+| 1.1 | 2026-04-02 | Dark-themed date pickers, dimmed zero values, label contrast improvements. |
 | 1.0 | 2026-04-02 | Initial release. Declined Payments + Post-assessment reports. |

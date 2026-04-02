@@ -1,9 +1,9 @@
-// Pike13 Reports v1.0 - Multi-report tool (Declined Payments, Post-assessment)
+// Pike13 Reports v1.1 - Multi-report tool (Declined Payments, Post-assessment)
 (function() {
 'use strict';
 
 const PANEL_ID = 'pike13-reports';
-const VERSION = '1.0';
+const VERSION = '1.1';
 const BUILD_DATE = '2026-04-02';
 const SUBDOMAIN = location.hostname.split('.')[0];
 const BASE = location.origin;
@@ -386,7 +386,9 @@ function renderPanel(status) {
   // Build table rows
   const trHtml = rows.map(r => {
     const tds = rpt.columns.map(c => {
-      const cls = c.align === 'center' ? ' class="num"' : '';
+      const val = r[c.idx];
+      const isZero = c.align === 'center' && (val === 0 || val === '0');
+      const cls = c.align === 'center' ? ` class="${isZero ? 'num-zero' : 'num'}"` : '';
       return `<td${cls}>${fmtCell(r, c)}</td>`;
     }).join('');
     return `<tr>${tds}</tr>`;
@@ -419,7 +421,7 @@ function renderPanel(status) {
   .hdr select {
     background:#1a1a2a; border:1px solid #555; color:#e0e0e0;
     padding:3px 8px; border-radius:4px; font-size:12px; font-family:inherit;
-    cursor:pointer;
+    cursor:pointer; color-scheme:dark;
   }
   .hdr select:focus { outline:none; border-color:#667eea; }
   .hdr-btns { display:flex; gap:4px; margin-left:auto; }
@@ -432,11 +434,11 @@ function renderPanel(status) {
     display:flex; align-items:center; gap:8px; flex-wrap:wrap;
     padding:8px 14px; background:#252538; border-bottom:1px solid #333;
   }
-  .toolbar label { color:#888; font-size:11px; }
+  .toolbar label { color:#aaa; font-size:11px; }
   .toolbar input[type="email"] {
     background:#1a1a2a; border:1px solid #444; color:#e0e0e0;
     padding:4px 8px; border-radius:4px; font-size:12px; width:180px;
-    font-family:inherit;
+    font-family:inherit; color-scheme:dark;
   }
   .toolbar input:focus { outline:none; border-color:#667eea; }
   .btn {
@@ -455,15 +457,16 @@ function renderPanel(status) {
   }
   .info-bar {
     display:flex; align-items:center; gap:8px; flex-wrap:wrap;
-    padding:5px 14px; background:#252530; border-bottom:1px solid #333;
+    padding:6px 14px; background:#252530; border-bottom:1px solid #333;
     font-size:11px; color:#888;
   }
   .info-bar input[type="date"] {
     background:#1a1a2a; border:1px solid #444; color:#e0e0e0;
-    padding:2px 6px; border-radius:4px; font-size:11px; font-family:inherit;
+    padding:3px 6px; border-radius:4px; font-size:11px; font-family:inherit;
+    color-scheme:dark;
   }
   .info-bar input[type="date"]:focus { outline:none; border-color:#667eea; }
-  .info-bar .info-label { color:#666; }
+  .info-bar .info-label { color:#aaa; font-size:11px; }
   .tag {
     display:inline-block; background:rgba(255,255,255,0.06); color:#999;
     padding:2px 8px; border-radius:3px; font-size:10px;
@@ -494,6 +497,7 @@ function renderPanel(status) {
   td a { color:#667eea; text-decoration:none; }
   td a:hover { text-decoration:underline; }
   .num { text-align:center; }
+  .num-zero { text-align:center; color:#555; }
   .warn { color:#f0a040; font-size:12px; padding:4px 14px; background:#2a2520; }
   .divider { width:1px; height:20px; background:#444; margin:0 4px; }
   .footer {
@@ -549,6 +553,7 @@ function renderPanel(status) {
       <span class="info-label">To:</span>
       <input type="date" id="rpt-date-end" value="${dateEnd}" />
       <button class="btn btn-sec" id="btn-apply-dates" style="padding:2px 8px;font-size:11px;">Apply</button>
+      ${tags.length ? '<span class="divider"></span>' : ''}
     ` : ''}
     ${tags.map(t => `<span class="tag">${esc(t)}</span>`).join('')}
   </div>
