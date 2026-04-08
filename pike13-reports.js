@@ -1,9 +1,9 @@
-// Pike13 Reports v1.10 - Visual restyle to match CRA tool palette (light theme, blue accent, softer shadows, readable contrast)
+// Pike13 Reports v1.11 - Duration normalization fixes, 14-day threshold, dash and multiplication-sign purge, formatted human-written summary
 (function() {
 'use strict';
 
 const PANEL_ID = 'pike13-reports';
-const VERSION = '1.10';
+const VERSION = '1.11';
 const BUILD_DATE = '2026-04-08';
 const SUBDOMAIN = location.hostname.split('.')[0];
 const BASE = location.origin;
@@ -16,12 +16,12 @@ if (!location.hostname.endsWith('.pike13.com')) {
 // ===================== HELPERS =====================
 
 function esc(s) {
-  if (s == null) return '—';
+  if (s == null) return '';
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 
 function fmtDate(d) {
-  if (!d) return '—';
+  if (!d) return '';
   const dt = new Date(d + 'T00:00:00');
   return dt.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
 }
@@ -34,7 +34,7 @@ function fmtDateISO(d) {
 }
 
 function fmtTime(t) {
-  if (!t) return '—';
+  if (!t) return '';
   const [h, m] = t.split(':');
   const hr = parseInt(h, 10);
   const ampm = hr >= 12 ? 'PM' : 'AM';
@@ -42,29 +42,36 @@ function fmtTime(t) {
 }
 
 function fmtCurrency(cents) {
-  if (cents == null) return '—';
+  if (cents == null) return '';
   return '$' + (Number(cents) / 100).toFixed(2);
 }
 
 // Convert a raw day count to a human-readable duration with up to two units.
-// Examples: 3 → "3d", 7 → "1w", 14 → "2w", 38 → "1mo 1w", 365 → "1y", 3080 → "8y 5mo".
-// Approximations: 1 month = 30 days, 1 year = 365 days. Good enough for invoice age display.
+// Under 14 days: raw day count (e.g. "3d", "13d"). 14-29 days: weeks plus
+// leftover days (e.g. "2w", "2w 3d"). 30-364 days: months plus leftover weeks
+// (e.g. "3mo", "5mo 1w"). 365+ days: years plus leftover months (e.g. "2y",
+// "8y 5mo"). Approximations: 1 month = 30 days, 1 year = 365 days. The >=4w
+// and >=12mo normalizations prevent edge cases like "6mo 4w" (which should be
+// "7mo") or "1y 12mo" (which should be "2y") that the naive modular math
+// would otherwise produce.
 function fmtDuration(days) {
-  if (days == null) return '—';
+  if (days == null) return '';
   const d = Math.abs(Math.floor(Number(days)));
-  if (d < 7) return `${d}d`;
+  if (d < 14) return `${d}d`;
   if (d < 30) {
     const w = Math.floor(d / 7);
     const rem = d % 7;
     return rem > 0 ? `${w}w ${rem}d` : `${w}w`;
   }
   if (d < 365) {
-    const mo = Math.floor(d / 30);
-    const remW = Math.floor((d % 30) / 7);
+    let mo = Math.floor(d / 30);
+    let remW = Math.floor((d % 30) / 7);
+    if (remW >= 4) { mo++; remW = 0; }
     return remW > 0 ? `${mo}mo ${remW}w` : `${mo}mo`;
   }
-  const y = Math.floor(d / 365);
-  const remMo = Math.floor((d % 365) / 30);
+  let y = Math.floor(d / 365);
+  let remMo = Math.floor((d % 365) / 30);
+  if (remMo >= 12) { y++; remMo = 0; }
   return remMo > 0 ? `${y}y ${remMo}mo` : `${y}y`;
 }
 
@@ -110,7 +117,7 @@ const REPORTS = [
     rowNoun: 'invoice',
     emailSubject: () => {
       const m = new Date().toLocaleString('en-US', { month: 'long', year: 'numeric' });
-      return `Declined Payments Report – ${m}`;
+      return `Declined Payments Report for ${m}`;
     },
     emptyMsg: 'No declined payments found.',
     loadingMsg: 'Fetching declined payments…',
@@ -161,7 +168,7 @@ const REPORTS = [
     rowNoun: 'event',
     emailSubject: () => {
       const f = d => new Date(d + 'T00:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
-      return `Post-assessment Report – ${f(dateStart)} to ${f(dateEnd)}`;
+      return `Post-assessment Report for ${f(dateStart)} to ${f(dateEnd)}`;
     },
     emptyMsg: 'No incomplete assessments found.',
     loadingMsg: 'Fetching assessments…',
@@ -191,19 +198,21 @@ const REPORTS = [
     filterTags: () => ['Matches /today/unpaid_invoices', 'Joined to business-wide active plans'],
     emailSubject: () => {
       const today = new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
-      return `Unpaid Invoice Triage – ${today}`;
+      return `Unpaid Invoice Triage for ${today}`;
     },
-    // Plain-text summary prepended when "Include summary" is checked.
-    // Returns flowing prose paragraphs separated by blank lines, with no
-    // hardcoded line breaks inside paragraphs — each paragraph wraps naturally
-    // based on the rendering surface's width. Used by all three copy formats.
+    // Returns a structured array of content blocks for the summary preamble,
+    // written as a short human-readable report: an intro sentence, a labeled
+    // bullet list of categories, and (if applicable) an urgent-subset callout.
+    // Each builder renders the blocks into its own output format. HTML wraps
+    // each paragraph in <p> and each list in <ul><li>, and the plain-text and
+    // Slack-mrkdwn outputs render bullets with a bullet character.
     buildExplanation: () => {
-      if (rows.length === 0) return '';
+      if (rows.length === 0) return [];
       const cats = {
-        'COLLECT':           { count: 0, owed: 0, desc: 'active customers owe — chase' },
-        'COLLECT (partial)': { count: 0, owed: 0, desc: 'partial paid' },
-        'CLEANUP':           { count: 0, owed: 0, desc: 'no active plan, safe to cancel' },
-        'CLEANUP (refund)':  { count: 0, owed: 0, desc: 'no active plan, refund first' },
+        'COLLECT':           { count: 0, owed: 0, desc: 'active customers who still owe. Chase these.' },
+        'COLLECT (partial)': { count: 0, owed: 0, desc: 'active customers, partial payment received. Collect the balance.' },
+        'CLEANUP':           { count: 0, owed: 0, desc: 'no active plan linked. Safe to cancel.' },
+        'CLEANUP (refund)':  { count: 0, owed: 0, desc: 'no active plan, payment on file. Refund first, then cancel.' },
       };
       let totalOwed = 0, urgentCount = 0, urgentOwed = 0;
       for (const r of rows) {
@@ -215,20 +224,26 @@ const REPORTS = [
       const fmt$ = c => '$' + (c / 100).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
       const labels = Object.keys(cats).filter(l => cats[l].count > 0);
 
-      // Build the breakdown as a single flowing sentence with proper Oxford-comma joining.
-      const parts = labels.map(l => `${cats[l].count} ${l} (${fmt$(cats[l].owed)}, ${cats[l].desc})`);
-      let breakdown;
-      if (parts.length === 1) breakdown = parts[0];
-      else if (parts.length === 2) breakdown = parts.join(' and ');
-      else breakdown = parts.slice(0, -1).join(', ') + ', and ' + parts[parts.length - 1];
-
-      const paragraphs = [];
-      paragraphs.push(`${rows.length} past-due invoices, ${fmt$(totalOwed)} outstanding total.`);
-      paragraphs.push(`Breakdown: ${breakdown}.`);
+      const blocks = [];
+      blocks.push({
+        type: 'paragraph',
+        text: `${rows.length} past-due invoices in the queue today, totaling ${fmt$(totalOwed)} outstanding.`
+      });
+      blocks.push({
+        type: 'list',
+        intro: 'How they break down:',
+        items: labels.map(l => {
+          const c = cats[l];
+          return `${c.count} ${l} (${fmt$(c.owed)}): ${c.desc}`;
+        })
+      });
       if (urgentCount > 0) {
-        paragraphs.push(`${urgentCount} of these have failed autobills (${fmt$(urgentOwed)}) — these are the urgent ones; the cards on file are declining and the customers likely don't realize.`);
+        blocks.push({
+          type: 'paragraph',
+          text: `${urgentCount} of these have failed autobills totaling ${fmt$(urgentOwed)}. These are the most urgent: the cards on file are declining and the customers probably don't know yet.`
+        });
       }
-      return paragraphs.join('\n\n');
+      return blocks;
     },
     columns: [
       { label: 'Status',         idx: 0, render: r => `<span class="cls ${clsSlug(r[0])}">${esc(r[0])}</span>` },
@@ -278,7 +293,7 @@ const REPORTS = [
         invToPlans.get(invId).push(planId);
       }
 
-      // Phase 3: business-wide active plan set (NO person filter — KL #237)
+      // Phase 3: business-wide active plan set (NO person filter, KL #237)
       const planAttrs = await queryV3('person_plans', {
         page: { limit: 2000 },
         fields: ['plan_id'],
@@ -303,24 +318,24 @@ const REPORTS = [
         let cls, rec;
         if (hasActivePlan && hasPayment && owedC > 0) {
           cls = 'COLLECT (partial)';
-          rec = `Partial paid ($${(paidC/100).toFixed(2)}) — collect $${(owedC/100).toFixed(2)} remaining`;
+          rec = `Partial paid ($${(paidC/100).toFixed(2)} of $${(totalC/100).toFixed(2)}): collect $${(owedC/100).toFixed(2)} balance`;
         } else if (hasActivePlan) {
           cls = 'COLLECT';
           if (autobill === 't' && failedTx >= 3) {
-            rec = `Auto-bill failed ${failedTx}× — update payment method or contact customer`;
+            rec = `Auto-bill failed ${failedTx} times: update payment method or contact customer`;
           } else if (autobill === 't' && failedTx > 0) {
-            rec = `Auto-bill failing (${failedTx} attempts) — monitor`;
+            rec = `Auto-bill failing (${failedTx} attempts): monitor`;
           } else if (autobill === 't') {
-            rec = `Auto-bill pending — will retry`;
+            rec = `Auto-bill pending: will retry`;
           } else {
-            rec = `Manual bill — send payment reminder`;
+            rec = `Manual bill: send payment reminder`;
           }
         } else if (hasPayment) {
           cls = 'CLEANUP (refund)';
           rec = `Refund $${(paidC/100).toFixed(2)} (paid by customer), then cancel`;
         } else {
           cls = 'CLEANUP';
-          rec = daysSince < 365 ? `Orphan (${fmtDuration(daysSince)}) — verify before cancelling` : `Stale orphan (${fmtDuration(daysSince)}) — safe to cancel`;
+          rec = daysSince < 365 ? `Orphan (${fmtDuration(daysSince)}): verify before cancelling` : `Stale orphan (${fmtDuration(daysSince)}): safe to cancel`;
         }
 
         out.push([
@@ -382,7 +397,7 @@ dateEnd = _initDates.end;
 const savedEmails = {};
 REPORTS.forEach(r => { savedEmails[r.id] = r.defaultEmail || ''; });
 
-// Per-report "Include summary" checkbox state — defaults to false
+// Per-report "Include summary" checkbox state, defaults to false
 const savedExplain = {};
 REPORTS.forEach(r => { savedExplain[r.id] = false; });
 
@@ -410,7 +425,7 @@ async function getAuthToken() {
   const html = await resp.text();
   // Check if we got redirected to a login page
   if (html.includes('sign_in') || html.includes('Log in') || html.includes('login')) {
-    throw new Error('Session expired — please log into the Pike13 desk and try again.');
+    throw new Error('Session expired. Please log into the Pike13 desk and try again.');
   }
   const m = html.match(/fd\.auth_token\s*=\s*'([0-9a-f-]{36})'/);
   if (!m) throw new Error('Could not extract auth_token. The page loaded but may not be the reports page. Try navigating to ' + BASE + '/desk/reports first.');
@@ -481,11 +496,11 @@ function fmtCellPlain(r, col) {
   if (col.format === 'date') return fmtDate(val);
   if (col.format === 'time') return fmtTime(val);
   if (col.format === 'currency') return fmtCurrency(val);
-  if (val == null) return '—';
+  if (val == null) return '';
   return String(val);
 }
 
-// Used by buildHtmlTable for clipboard output — same as fmtCellPlain but
+// Used by buildHtmlTable for clipboard output. Same as fmtCellPlain but
 // preserves links on columns that define a `link` callback. Does NOT invoke
 // the `render` callbacks (which produce panel-internal HTML with CSS classes
 // that won't carry over to email/Canvas destinations); instead it prefers
@@ -505,19 +520,56 @@ function fmtCellClipboardHtml(r, col) {
 
 // ===================== CLIPBOARD / EMAIL =====================
 
+// Render a structured explanation blocks array as HTML (<p>, <ul><li>) for
+// the clipboard output. Each format builder reads the same blocks and emits
+// its own format-appropriate markup.
+function renderExplanationAsHtml(blocks) {
+  if (!Array.isArray(blocks) || blocks.length === 0) return '';
+  let html = '';
+  for (const b of blocks) {
+    if (b.type === 'paragraph') {
+      html += `<p style="margin:0 0 8px;font-family:Arial,sans-serif;font-size:13px;">${esc(b.text)}</p>`;
+    } else if (b.type === 'list') {
+      if (b.intro) {
+        html += `<p style="margin:0 0 4px;font-family:Arial,sans-serif;font-size:13px;">${esc(b.intro)}</p>`;
+      }
+      html += '<ul style="margin:0 0 8px 20px;padding:0;font-family:Arial,sans-serif;font-size:13px;">';
+      for (const item of b.items) {
+        html += `<li style="margin:2px 0;">${esc(item)}</li>`;
+      }
+      html += '</ul>';
+    }
+  }
+  return html;
+}
+
+// Render the same blocks as plain text for clipboard and Slack-mrkdwn outputs.
+// Paragraphs are joined by blank lines, lists are rendered with a bullet
+// character followed by each item on its own line underneath an optional intro.
+function renderExplanationAsPlainText(blocks) {
+  if (!Array.isArray(blocks) || blocks.length === 0) return '';
+  const parts = [];
+  for (const b of blocks) {
+    if (b.type === 'paragraph') {
+      parts.push(b.text);
+    } else if (b.type === 'list') {
+      let s = '';
+      if (b.intro) s += b.intro + '\n';
+      s += b.items.map(i => '• ' + i).join('\n');
+      parts.push(s);
+    }
+  }
+  return parts.join('\n\n');
+}
+
 function buildHtmlTable() {
   const rpt = report();
   let html = `<p style="margin:0 0 8px;font-family:Arial,sans-serif;font-size:14px;font-weight:bold;">${esc(rpt.emailSubject())}</p>`;
   // Optional summary preamble (toggled by the "Include summary" checkbox).
-  // Render each paragraph as a separate <p> so the text wraps naturally
-  // based on the rendering width.
+  // Rendered as real <p> and <ul><li> elements so it renders as a proper
+  // formatted document in email / Canvas / any rich-text destination.
   if (savedExplain[currentReportId] && rpt.buildExplanation) {
-    const explanation = rpt.buildExplanation();
-    if (explanation) {
-      for (const para of explanation.split('\n\n')) {
-        html += `<p style="margin:0 0 8px;font-family:Arial,sans-serif;font-size:13px;">${esc(para)}</p>`;
-      }
-    }
+    html += renderExplanationAsHtml(rpt.buildExplanation());
   }
   html += `<table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse;font-family:Arial,sans-serif;font-size:13px;">`;
   html += `<tr style="background:#f0f0f0;font-weight:bold;">`;
@@ -542,8 +594,8 @@ function buildPlainTable() {
   const rpt = report();
   let txt = rpt.emailSubject() + '\n\n';
   if (savedExplain[currentReportId] && rpt.buildExplanation) {
-    const explanation = rpt.buildExplanation();
-    if (explanation) txt += explanation + '\n\n';
+    const ex = renderExplanationAsPlainText(rpt.buildExplanation());
+    if (ex) txt += ex + '\n\n';
   }
   txt += rpt.columns.map(c => c.label).join('\t') + '\n';
   for (const r of rows) {
@@ -600,13 +652,13 @@ function buildSlackTable() {
   const title = rpt.emailSubject();
   const noun = rpt.rowNoun || 'row';
   const countLine = `_${rows.length} ${noun}${rows.length !== 1 ? 's' : ''}_`;
-  // Optional summary preamble — placed ABOVE the code block as Slack message
+  // Optional summary preamble placed ABOVE the code block as Slack message
   // text. Slack wraps message paragraphs naturally; placing the prose inside
   // the code block would force monospace, which makes long lines wrap badly.
   let preamble = '';
   if (savedExplain[currentReportId] && rpt.buildExplanation) {
-    const explanation = rpt.buildExplanation();
-    if (explanation) preamble = '\n\n' + explanation;
+    const ex = renderExplanationAsPlainText(rpt.buildExplanation());
+    if (ex) preamble = '\n\n' + ex;
   }
   return `*${title}*\n${countLine}${preamble}\n\n\`\`\`\n${headerRow}\n${sep}\n${dataRows.join('\n')}\n\`\`\``;
 }
@@ -650,13 +702,13 @@ async function copyForSlack() {
   }
   const charCount = text.length.toLocaleString();
   // Slack's per-message compose limit is 4,000 characters. Messages over this
-  // can't be sent — Slack shows an overflow badge in the compose box. v1.6 had
+  // can't be sent; Slack shows an overflow badge in the compose box. v1.6 had
   // this set to 12000 which never fired in the danger zone.
   const overLimit = text.length > 4000;
   if (overLimit) {
-    showToast(`⚠ Copied ${charCount} chars — exceeds Slack's 4,000-char message limit. Use 📋 HTML and paste into a Slack Canvas instead for tables this large.`, true);
+    showToast(`⚠ Copied ${charCount} chars, which exceeds Slack's 4,000-char message limit. Use 📋 HTML and paste into a Slack Canvas instead for tables this large.`, true);
   } else {
-    showToast(`✓ Copied for Slack — paste into Slack message (${charCount} chars)`);
+    showToast(`✓ Copied for Slack. Paste into Slack message (${charCount} chars)`);
   }
 }
 
@@ -687,7 +739,7 @@ async function emailReport() {
   if (!ok) { showToast('⚠ Clipboard copy failed'); return; }
   const subject = encodeURIComponent(report().emailSubject());
   window.open(`https://webmail.musicplace.com/?_task=mail&_action=compose&_to=${encodeURIComponent(email)}&_subject=${subject}`, '_blank');
-  showToast('✓ Table copied — Ctrl+V to paste into email body', true);
+  showToast('✓ Table copied. Ctrl+V to paste into email body', true);
 }
 
 // ===================== RENDER =====================
@@ -960,8 +1012,8 @@ function renderPanel(status) {
   </div>
   ${isMinimized ? '' : `
   <div class="toolbar">
-    <button class="btn btn-pri" id="btn-copy" ${rows.length === 0 ? 'disabled' : ''} title="Copy as HTML table — paste into email or any rich-text destination">📋 HTML</button>
-    <button class="btn btn-pri" id="btn-copy-slack" ${rows.length === 0 ? 'disabled' : ''} title="Copy as Slack mrkdwn with monospace code block — paste into a Slack message. Best for short tables under 4,000 characters; wide tables (like Unpaid Invoice Triage) won't fit and won't render correctly. Use 📋 HTML and paste into a Slack Canvas instead for those.">💬 Slack</button>
+    <button class="btn btn-pri" id="btn-copy" ${rows.length === 0 ? 'disabled' : ''} title="Copy as HTML table. Paste into email or any rich-text destination.">📋 HTML</button>
+    <button class="btn btn-pri" id="btn-copy-slack" ${rows.length === 0 ? 'disabled' : ''} title="Copy as Slack mrkdwn with monospace code block. Paste into a Slack message. Best for short tables under 4,000 characters; wide tables (like Unpaid Invoice Triage) will not fit and will not render correctly. Use 📋 HTML and paste into a Slack Canvas instead for those.">💬 Slack</button>
     ${rpt.buildExplanation ? `
     <label class="checkbox-label" title="Prepend a category breakdown / totals to the copied output">
       <input type="checkbox" id="rpt-include-explain" ${savedExplain[currentReportId] ? 'checked' : ''} />
@@ -994,7 +1046,7 @@ function renderPanel(status) {
     ` : rows.length === 0 ? `
       <div class="status-msg">${rpt.emptyMsg}</div>
     ` : `
-      ${rows._hasMore ? '<div class="warn">⚠ More than 500 results — only first 500 shown.</div>' : ''}
+      ${rows._hasMore ? '<div class="warn">⚠ More than 500 results. Only first 500 shown.</div>' : ''}
       <table>
         <thead><tr>${thHtml}</tr></thead>
         <tbody>${trHtml}</tbody>
@@ -1010,7 +1062,7 @@ function renderPanel(status) {
   shadow.getElementById('btn-email')?.addEventListener('click', emailReport);
   shadow.getElementById('btn-copy')?.addEventListener('click', async () => {
     await copyTableToClipboard();
-    showToast('✓ HTML table copied — paste into email or rich-text');
+    showToast('✓ HTML table copied. Paste into email or rich-text');
   });
   shadow.getElementById('btn-copy-slack')?.addEventListener('click', copyForSlack);
   shadow.getElementById('rpt-include-explain')?.addEventListener('change', e => {
