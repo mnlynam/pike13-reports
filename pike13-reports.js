@@ -1,9 +1,9 @@
-// Pike13 Reports v1.7 - Multi-report tool + HTML / Slack mrkdwn / Slack Canvas markdown copy formats; corrected Slack 4000-char warning
+// Pike13 Reports v1.8 - Removed redundant Canvas button (HTML paste does the same thing); human-readable duration formatting
 (function() {
 'use strict';
 
 const PANEL_ID = 'pike13-reports';
-const VERSION = '1.7';
+const VERSION = '1.8';
 const BUILD_DATE = '2026-04-08';
 const SUBDOMAIN = location.hostname.split('.')[0];
 const BASE = location.origin;
@@ -44,6 +44,28 @@ function fmtTime(t) {
 function fmtCurrency(cents) {
   if (cents == null) return '—';
   return '$' + (Number(cents) / 100).toFixed(2);
+}
+
+// Convert a raw day count to a human-readable duration with up to two units.
+// Examples: 3 → "3d", 7 → "1w", 14 → "2w", 38 → "1mo 1w", 365 → "1y", 3080 → "8y 5mo".
+// Approximations: 1 month = 30 days, 1 year = 365 days. Good enough for invoice age display.
+function fmtDuration(days) {
+  if (days == null) return '—';
+  const d = Math.abs(Math.floor(Number(days)));
+  if (d < 7) return `${d}d`;
+  if (d < 30) {
+    const w = Math.floor(d / 7);
+    const rem = d % 7;
+    return rem > 0 ? `${w}w ${rem}d` : `${w}w`;
+  }
+  if (d < 365) {
+    const mo = Math.floor(d / 30);
+    const remW = Math.floor((d % 30) / 7);
+    return remW > 0 ? `${mo}mo ${remW}w` : `${mo}mo`;
+  }
+  const y = Math.floor(d / 365);
+  const remMo = Math.floor((d % 365) / 30);
+  return remMo > 0 ? `${y}y ${remMo}mo` : `${y}y`;
 }
 
 function clsSlug(s) {
@@ -213,7 +235,7 @@ const REPORTS = [
       { label: 'Client',         idx: 3, link: r => `${BASE}/people/${r[4]}` },
       { label: 'Invoice',        idx: 1, link: r => `${BASE}/invoices/${r[2]}` },
       { label: 'Owed',           idx: 5, format: 'currency', align: 'right' },
-      { label: 'Days',           idx: 8, align: 'center' },
+      { label: 'Past Due',       idx: 8, align: 'center', render: r => fmtDuration(r[8]), renderPlain: r => fmtDuration(r[8]) },
       { label: 'Autobill',       idx: 10, align: 'center' },
       { label: 'Fails',          idx: 11, align: 'center', render: r => {
         const v = r[11];
@@ -298,7 +320,7 @@ const REPORTS = [
           rec = `Refund $${(paidC/100).toFixed(2)} (paid by customer), then cancel`;
         } else {
           cls = 'CLEANUP';
-          rec = daysSince < 365 ? `Orphan (${daysSince}d) — verify before cancelling` : `Stale orphan (${daysSince}d) — safe to cancel`;
+          rec = daysSince < 365 ? `Orphan (${fmtDuration(daysSince)}) — verify before cancelling` : `Stale orphan (${fmtDuration(daysSince)}) — safe to cancel`;
         }
 
         out.push([
@@ -571,50 +593,6 @@ function buildSlackTable() {
   return `*${title}*\n${countLine}${preamble}\n\n\`\`\`\n${headerRow}\n${sep}\n${dataRows.join('\n')}\n\`\`\``;
 }
 
-function buildCanvasMarkdown() {
-  // Produces GitHub-flavored Markdown intended for Slack Canvas. Slack Canvas
-  // renders real markdown tables (| col | col |) as actual HTML tables, which
-  // sidesteps the line-wrapping problems that break monospace code blocks in
-  // regular Slack messages. The output is also fine for any other GFM-rendering
-  // surface (GitHub, Notion, Obsidian, etc.).
-  const rpt = report();
-  if (rows.length === 0) return '';
-
-  let md = `# ${rpt.emailSubject()}\n\n`;
-  md += `_${rows.length} ${rpt.rowNoun || 'row'}${rows.length !== 1 ? 's' : ''}_\n\n`;
-
-  // Optional summary preamble (toggled by the "Include summary" checkbox).
-  // Plain flowing-prose paragraphs render natively as Canvas paragraphs that
-  // wrap based on Canvas width — no markdown table needed for the breakdown.
-  if (savedExplain[currentReportId] && rpt.buildExplanation) {
-    const explanation = rpt.buildExplanation();
-    if (explanation) md += explanation + '\n\n';
-  }
-
-  // Header + alignment row. Use right-alignment markers (---:) for currency
-  // and centered (:---:) for centered columns; default to left.
-  const headers = rpt.columns.map(c => c.label);
-  md += '| ' + headers.join(' | ') + ' |\n';
-  md += '|' + rpt.columns.map(c => {
-    if (c.format === 'currency' || c.align === 'right') return '---:';
-    if (c.align === 'center') return ':---:';
-    return '---';
-  }).join('|') + '|\n';
-
-  // Data rows — strip HTML, escape pipes, collapse newlines.
-  for (const r of rows) {
-    const cells = rpt.columns.map(c => {
-      let v = fmtCellPlain(r, c);
-      v = v.replace(/<[^>]+>/g, '');
-      v = v.replace(/\|/g, '\\|').replace(/\n/g, ' ');
-      return v;
-    });
-    md += '| ' + cells.join(' | ') + ' |\n';
-  }
-
-  return md;
-}
-
 async function copyTableToClipboard() {
   const htmlContent = buildHtmlTable();
   const plainContent = buildPlainTable();
@@ -658,27 +636,10 @@ async function copyForSlack() {
   // this set to 12000 which never fired in the danger zone.
   const overLimit = text.length > 4000;
   if (overLimit) {
-    showToast(`⚠ Copied ${charCount} chars — exceeds Slack's 4,000-char message limit. Use 📝 Canvas instead for tables this large.`, true);
+    showToast(`⚠ Copied ${charCount} chars — exceeds Slack's 4,000-char message limit. Use 📋 HTML and paste into a Slack Canvas instead for tables this large.`, true);
   } else {
     showToast(`✓ Copied for Slack — paste into Slack message (${charCount} chars)`);
   }
-}
-
-async function copyForCanvas() {
-  if (rows.length === 0) { showToast('⚠ Nothing to copy'); return; }
-  const text = buildCanvasMarkdown();
-  try {
-    await navigator.clipboard.writeText(text);
-  } catch (e) {
-    console.warn('Canvas clipboard write failed, falling back:', e);
-    const ta = document.createElement('textarea');
-    ta.value = text;
-    document.body.appendChild(ta);
-    ta.select();
-    document.execCommand('copy');
-    ta.remove();
-  }
-  showToast('✓ Markdown copied — open a Slack Canvas and paste to render as a table', true);
 }
 
 function showToast(msg, persistent) {
@@ -903,8 +864,7 @@ function renderPanel(status) {
   ${isMinimized ? '' : `
   <div class="toolbar">
     <button class="btn btn-pri" id="btn-copy" ${rows.length === 0 ? 'disabled' : ''} title="Copy as HTML table — paste into email or any rich-text destination">📋 HTML</button>
-    <button class="btn btn-pri" id="btn-copy-slack" ${rows.length === 0 ? 'disabled' : ''} title="Copy as Slack mrkdwn with monospace code block — paste into a Slack message. Best for short tables under 4,000 characters; wide tables (like Unpaid Invoice Triage) won't fit and won't render correctly. Use 📝 Canvas instead for those.">💬 Slack</button>
-    <button class="btn btn-pri" id="btn-copy-canvas" ${rows.length === 0 ? 'disabled' : ''} title="Copy as GitHub-flavored Markdown — paste into a Slack Canvas to render as a real table">📝 Canvas</button>
+    <button class="btn btn-pri" id="btn-copy-slack" ${rows.length === 0 ? 'disabled' : ''} title="Copy as Slack mrkdwn with monospace code block — paste into a Slack message. Best for short tables under 4,000 characters; wide tables (like Unpaid Invoice Triage) won't fit and won't render correctly. Use 📋 HTML and paste into a Slack Canvas instead for those.">💬 Slack</button>
     ${rpt.buildExplanation ? `
     <label class="checkbox-label" title="Prepend a category breakdown / totals to the copied output">
       <input type="checkbox" id="rpt-include-explain" ${savedExplain[currentReportId] ? 'checked' : ''} />
@@ -959,7 +919,6 @@ function renderPanel(status) {
     showToast('✓ HTML table copied — paste into email or rich-text');
   });
   shadow.getElementById('btn-copy-slack')?.addEventListener('click', copyForSlack);
-  shadow.getElementById('btn-copy-canvas')?.addEventListener('click', copyForCanvas);
   shadow.getElementById('rpt-include-explain')?.addEventListener('change', e => {
     savedExplain[currentReportId] = e.target.checked;
   });
