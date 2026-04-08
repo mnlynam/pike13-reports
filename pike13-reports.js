@@ -1,9 +1,9 @@
-// Pike13 Reports v1.4 - Multi-report tool + HTML/Slack mrkdwn copy formats + optional summary preamble
+// Pike13 Reports v1.5 - Multi-report tool + HTML / Slack mrkdwn / Slack Canvas markdown copy formats
 (function() {
 'use strict';
 
 const PANEL_ID = 'pike13-reports';
-const VERSION = '1.4';
+const VERSION = '1.5';
 const BUILD_DATE = '2026-04-08';
 const SUBDOMAIN = location.hostname.split('.')[0];
 const BASE = location.origin;
@@ -207,6 +207,37 @@ const REPORTS = [
         lines.push(`${urgentCount} of these have failed autobills (${fmt$(urgentOwed)}) — these are the urgent ones; the cards on file are declining and the customers likely don't realize.`);
       }
       return lines.join('\n');
+    },
+    // GFM-formatted version of the summary for Slack Canvas — uses a real
+    // markdown table and bold callout instead of monospace alignment.
+    buildExplanationMarkdown: () => {
+      if (rows.length === 0) return '';
+      const cats = {
+        'COLLECT':           { count: 0, owed: 0, desc: 'active customers owe — chase' },
+        'COLLECT (partial)': { count: 0, owed: 0, desc: 'active customers, partial paid' },
+        'CLEANUP':           { count: 0, owed: 0, desc: 'no active plan — safe to cancel' },
+        'CLEANUP (refund)':  { count: 0, owed: 0, desc: 'no active plan, payment to refund first' },
+      };
+      let totalOwed = 0, urgentCount = 0, urgentOwed = 0;
+      for (const r of rows) {
+        const cls = r[0], owedC = r[5], autobill = r[10], failedTx = r[11];
+        if (cats[cls]) { cats[cls].count++; cats[cls].owed += owedC; }
+        totalOwed += owedC;
+        if (autobill === 'yes' && failedTx >= 3) { urgentCount++; urgentOwed += owedC; }
+      }
+      const fmt$ = c => '$' + (c / 100).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+      const labels = Object.keys(cats).filter(l => cats[l].count > 0);
+      let md = `**${rows.length} past-due invoices, ${fmt$(totalOwed)} outstanding total.**\n\n`;
+      md += '| Category | Count | Outstanding | Description |\n';
+      md += '|---|---:|---:|---|\n';
+      for (const l of labels) {
+        const c = cats[l];
+        md += `| ${l} | ${c.count} | ${fmt$(c.owed)} | ${c.desc} |\n`;
+      }
+      if (urgentCount > 0) {
+        md += `\n🔴 **${urgentCount} of these have failed autobills** (${fmt$(urgentOwed)}) — these are the urgent ones; the cards on file are declining and the customers likely don't realize.\n`;
+      }
+      return md;
     },
     columns: [
       { label: 'Status',         idx: 0, render: r => `<span class="cls ${clsSlug(r[0])}">${esc(r[0])}</span>` },
@@ -566,6 +597,55 @@ function buildSlackTable() {
   return `*${title}*\n${countLine}\n\`\`\`\n${preamble}${headerRow}\n${sep}\n${dataRows.join('\n')}\n\`\`\``;
 }
 
+function buildCanvasMarkdown() {
+  // Produces GitHub-flavored Markdown intended for Slack Canvas. Slack Canvas
+  // renders real markdown tables (| col | col |) as actual HTML tables, which
+  // sidesteps the line-wrapping problems that break monospace code blocks in
+  // regular Slack messages. The output is also fine for any other GFM-rendering
+  // surface (GitHub, Notion, Obsidian, etc.).
+  const rpt = report();
+  if (rows.length === 0) return '';
+
+  let md = `# ${rpt.emailSubject()}\n\n`;
+  md += `_${rows.length} ${rpt.rowNoun || 'row'}${rows.length !== 1 ? 's' : ''}_\n\n`;
+
+  // Optional summary preamble (toggled by the "Include summary" checkbox).
+  // Prefer the markdown variant; fall back to plain text wrapped in a code
+  // block if only buildExplanation is defined.
+  if (savedExplain[currentReportId]) {
+    if (rpt.buildExplanationMarkdown) {
+      const explanation = rpt.buildExplanationMarkdown();
+      if (explanation) md += explanation + '\n\n';
+    } else if (rpt.buildExplanation) {
+      const explanation = rpt.buildExplanation();
+      if (explanation) md += '```\n' + explanation + '\n```\n\n';
+    }
+  }
+
+  // Header + alignment row. Use right-alignment markers (---:) for currency
+  // and centered (:---:) for centered columns; default to left.
+  const headers = rpt.columns.map(c => c.label);
+  md += '| ' + headers.join(' | ') + ' |\n';
+  md += '|' + rpt.columns.map(c => {
+    if (c.format === 'currency' || c.align === 'right') return '---:';
+    if (c.align === 'center') return ':---:';
+    return '---';
+  }).join('|') + '|\n';
+
+  // Data rows — strip HTML, escape pipes, collapse newlines.
+  for (const r of rows) {
+    const cells = rpt.columns.map(c => {
+      let v = fmtCellPlain(r, c);
+      v = v.replace(/<[^>]+>/g, '');
+      v = v.replace(/\|/g, '\\|').replace(/\n/g, ' ');
+      return v;
+    });
+    md += '| ' + cells.join(' | ') + ' |\n';
+  }
+
+  return md;
+}
+
 async function copyTableToClipboard() {
   const htmlContent = buildHtmlTable();
   const plainContent = buildPlainTable();
@@ -610,6 +690,23 @@ async function copyForSlack() {
   } else {
     showToast(`✓ Copied for Slack — paste into Slack message (${charCount} chars)`);
   }
+}
+
+async function copyForCanvas() {
+  if (rows.length === 0) { showToast('⚠ Nothing to copy'); return; }
+  const text = buildCanvasMarkdown();
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch (e) {
+    console.warn('Canvas clipboard write failed, falling back:', e);
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand('copy');
+    ta.remove();
+  }
+  showToast('✓ Markdown copied — open a Slack Canvas and paste to render as a table', true);
 }
 
 function showToast(msg, persistent) {
@@ -834,7 +931,8 @@ function renderPanel(status) {
   ${isMinimized ? '' : `
   <div class="toolbar">
     <button class="btn btn-pri" id="btn-copy" ${rows.length === 0 ? 'disabled' : ''} title="Copy as HTML table — paste into email or any rich-text destination">📋 HTML</button>
-    <button class="btn btn-pri" id="btn-copy-slack" ${rows.length === 0 ? 'disabled' : ''} title="Copy as Slack mrkdwn message with monospace code block — paste into a Slack message">💬 Slack</button>
+    <button class="btn btn-pri" id="btn-copy-slack" ${rows.length === 0 ? 'disabled' : ''} title="Copy as Slack mrkdwn message with monospace code block — paste into a Slack message (best for short tables; may not render correctly for wide ones)">💬 Slack</button>
+    <button class="btn btn-pri" id="btn-copy-canvas" ${rows.length === 0 ? 'disabled' : ''} title="Copy as GitHub-flavored Markdown — paste into a Slack Canvas to render as a real table">📝 Canvas</button>
     ${rpt.buildExplanation ? `
     <label class="checkbox-label" title="Prepend a category breakdown / totals to the copied output">
       <input type="checkbox" id="rpt-include-explain" ${savedExplain[currentReportId] ? 'checked' : ''} />
@@ -889,6 +987,7 @@ function renderPanel(status) {
     showToast('✓ HTML table copied — paste into email or rich-text');
   });
   shadow.getElementById('btn-copy-slack')?.addEventListener('click', copyForSlack);
+  shadow.getElementById('btn-copy-canvas')?.addEventListener('click', copyForCanvas);
   shadow.getElementById('rpt-include-explain')?.addEventListener('change', e => {
     savedExplain[currentReportId] = e.target.checked;
   });
