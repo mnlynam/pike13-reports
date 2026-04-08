@@ -1,10 +1,10 @@
-// Pike13 Reports v1.1 - Multi-report tool (Declined Payments, Post-assessment)
+// Pike13 Reports v1.2 - Multi-report tool (Declined Payments, Post-assessment, Unpaid Invoice Triage)
 (function() {
 'use strict';
 
 const PANEL_ID = 'pike13-reports';
-const VERSION = '1.1';
-const BUILD_DATE = '2026-04-02';
+const VERSION = '1.2';
+const BUILD_DATE = '2026-04-08';
 const SUBDOMAIN = location.hostname.split('.')[0];
 const BASE = location.origin;
 
@@ -39,6 +39,15 @@ function fmtTime(t) {
   const hr = parseInt(h, 10);
   const ampm = hr >= 12 ? 'PM' : 'AM';
   return `${hr % 12 || 12}:${m} ${ampm}`;
+}
+
+function fmtCurrency(cents) {
+  if (cents == null) return '—';
+  return '$' + (Number(cents) / 100).toFixed(2);
+}
+
+function clsSlug(s) {
+  return 'cls-' + String(s).toLowerCase().replace(/[^a-z]+/g, '-').replace(/^-|-$/g, '');
 }
 
 // ===================== REPORT DEFINITIONS =====================
@@ -144,6 +153,138 @@ const REPORTS = [
       };
     },
     filterTags: () => ['Personalized Aptitude Assessment', 'Attendance not completed', 'Not internal'],
+  },
+  {
+    // ===== Unpaid Invoice Triage =====
+    // Replicates /today/unpaid_invoices and classifies each row as collections-worthy
+    // or cleanup-eligible by joining invoice line items to the business-wide active plan set.
+    // Three batch report calls, zero per-invoice fetches. ~2 seconds for ~100 invoices.
+    id: 'unpaid_triage',
+    name: 'Unpaid Invoice Triage',
+    rowNoun: 'invoice',
+    emptyMsg: 'No past-due invoices found. 🎉',
+    loadingMsg: 'Triaging unpaid invoices…',
+    defaultEmail: 'lcaploe@musicplace.com',
+    dateRange: false,
+    filterTags: () => ['Matches /today/unpaid_invoices', 'Joined to business-wide active plans'],
+    emailSubject: () => {
+      const today = new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+      return `Unpaid Invoice Triage – ${today}`;
+    },
+    columns: [
+      { label: 'Status',         idx: 0, render: r => `<span class="cls ${clsSlug(r[0])}">${esc(r[0])}</span>` },
+      { label: 'Client',         idx: 3, link: r => `${BASE}/people/${r[4]}` },
+      { label: 'Invoice',        idx: 1, link: r => `${BASE}/invoices/${r[2]}` },
+      { label: 'Owed',           idx: 5, format: 'currency', align: 'right' },
+      { label: 'Days',           idx: 8, align: 'center' },
+      { label: 'Autobill',       idx: 10, align: 'center' },
+      { label: 'Fails',          idx: 11, align: 'center', render: r => {
+        const v = r[11];
+        if (v >= 3) return `<span style="color:#e89090;font-weight:600">${v}</span>`;
+        if (v > 0) return `<span style="color:#f5c878">${v}</span>`;
+        return `<span style="color:#555">${v}</span>`;
+      }},
+      { label: 'Recommendation', idx: 12 },
+    ],
+    customFetch: async (token, queryV3) => {
+      // Phase 1: invoices matching /today/unpaid_invoices (KL #235)
+      const invAttrs = await queryV3('invoices', {
+        page: { limit: 2000 },
+        fields: [
+          'invoice_id', 'invoice_number', 'invoice_payer_name', 'invoice_payer_id',
+          'issued_date', 'expected_amount', 'net_paid_amount', 'outstanding_amount',
+          'days_since_invoice_due', 'invoice_autobill', 'failed_transactions'
+        ],
+        filter: ['and', [
+          ['eq', 'invoice_state', 'open'],
+          ['gt', 'outstanding_amount', 0],
+          ['gt', 'days_since_invoice_due', 0]
+        ]]
+      }, token);
+      const invRows = invAttrs.rows || [];
+      if (invRows.length === 0) return { rows: [], totalCount: 0, hasMore: false };
+
+      // Phase 2: line items for those invoices, using hidden plan_id field (KL #234)
+      const invIds = invRows.map(r => r[0]);
+      const itemAttrs = await queryV3('invoice_items', {
+        page: { limit: 2000 },
+        fields: ['invoice_id', 'plan_id'],
+        filter: ['or', invIds.map(id => ['eq', 'invoice_id', id])]
+      }, token);
+      const invToPlans = new Map();
+      for (const it of (itemAttrs.rows || [])) {
+        const [invId, planId] = it;
+        if (planId == null) continue;
+        if (!invToPlans.has(invId)) invToPlans.set(invId, []);
+        invToPlans.get(invId).push(planId);
+      }
+
+      // Phase 3: business-wide active plan set (NO person filter — KL #237)
+      const planAttrs = await queryV3('person_plans', {
+        page: { limit: 2000 },
+        fields: ['plan_id'],
+        filter: ['and', [
+          ['eq', 'is_canceled', 'f'],
+          ['eq', 'is_ended', 'f'],
+          ['eq', 'is_deactivated', 'f'],
+          ['eq', 'is_exhausted', 'f'],
+          ['ne', 'plan_type', 'late_cancellation_fee']
+        ]]
+      }, token);
+      const activePlanIds = new Set((planAttrs.rows || []).map(r => r[0]));
+
+      // Classify each invoice
+      const out = [];
+      for (const r of invRows) {
+        const [iid, iNum, payerName, payerId, issued, totalC, paidC, owedC, daysSince, autobill, failedTx] = r;
+        const linkedPlans = invToPlans.get(iid) || [];
+        const hasActivePlan = linkedPlans.some(p => activePlanIds.has(p));
+        const hasPayment = paidC > 0;
+
+        let cls, rec;
+        if (hasActivePlan && hasPayment && owedC > 0) {
+          cls = 'COLLECT (partial)';
+          rec = `Partial paid ($${(paidC/100).toFixed(2)}) — collect $${(owedC/100).toFixed(2)} remaining`;
+        } else if (hasActivePlan) {
+          cls = 'COLLECT';
+          if (autobill === 't' && failedTx >= 3) {
+            rec = `Auto-bill failed ${failedTx}× — update payment method or contact customer`;
+          } else if (autobill === 't' && failedTx > 0) {
+            rec = `Auto-bill failing (${failedTx} attempts) — monitor`;
+          } else if (autobill === 't') {
+            rec = `Auto-bill pending — will retry`;
+          } else {
+            rec = `Manual bill — send payment reminder`;
+          }
+        } else if (hasPayment) {
+          cls = 'CLEANUP (refund)';
+          rec = `Refund $${(paidC/100).toFixed(2)} (paid by customer), then cancel`;
+        } else {
+          cls = 'CLEANUP';
+          rec = daysSince < 365 ? `Orphan (${daysSince}d) — verify before cancelling` : `Stale orphan (${daysSince}d) — safe to cancel`;
+        }
+
+        out.push([
+          cls,                              // 0  status
+          iNum,                             // 1  invoice number
+          iid,                              // 2  invoice id (hidden, for link)
+          payerName,                        // 3  payer name
+          payerId,                          // 4  payer id (hidden, for link)
+          owedC,                            // 5  outstanding cents
+          totalC,                           // 6  expected cents (hidden)
+          paidC,                            // 7  net paid cents (hidden)
+          daysSince,                        // 8  days past due
+          issued,                           // 9  issued date (hidden)
+          autobill === 't' ? 'yes' : 'no',  // 10 autobill
+          failedTx,                         // 11 failed_transactions
+          rec                               // 12 recommendation
+        ]);
+      }
+
+      // Sort by Owed descending (collections opportunities first)
+      out.sort((a, b) => b[5] - a[5]);
+      return { rows: out, totalCount: out.length, hasMore: false };
+    }
   }
 ];
 
@@ -215,9 +356,8 @@ async function getAuthToken() {
 
 // ===================== REPORT QUERY =====================
 
-async function fetchReport(token) {
-  const rpt = report();
-  const url = `${BASE}/desk/api/v3/reports/${rpt.slug}/queries?auth_token=${token}&subdomain=${SUBDOMAIN}`;
+async function queryV3(slug, attributes, token) {
+  const url = `${BASE}/desk/api/v3/reports/${slug}/queries?auth_token=${token}&subdomain=${SUBDOMAIN}`;
   const resp = await fetch(url, {
     method: 'POST',
     credentials: 'include',
@@ -226,25 +366,30 @@ async function fetchReport(token) {
       'content-type': 'application/vnd.api+json',
       'x-requested-with': 'XMLHttpRequest'
     },
-    body: JSON.stringify({
-      data: {
-        type: 'queries',
-        attributes: {
-          page: { limit: 500 },
-          fields: rpt.fields,
-          total_count: 't',
-          filter: rpt.getFilter(),
-          sort: rpt.sort
-        }
-      }
-    })
+    body: JSON.stringify({ data: { type: 'queries', attributes } })
   });
   if (!resp.ok) {
     const body = await resp.text();
-    throw new Error(`Report query failed (${resp.status}): ${body.slice(0, 300)}`);
+    throw new Error(`${slug} query failed (${resp.status}): ${body.slice(0, 300)}`);
   }
   const json = await resp.json();
-  const attrs = json.data.attributes;
+  return json.data.attributes;
+}
+
+async function fetchReport(token) {
+  const rpt = report();
+  // Custom fetch hook for reports that need multi-phase queries / client-side joins
+  if (rpt.customFetch) {
+    return await rpt.customFetch(token, queryV3);
+  }
+  // Default single-query path
+  const attrs = await queryV3(rpt.slug, {
+    page: { limit: 500 },
+    fields: rpt.fields,
+    total_count: 't',
+    filter: rpt.getFilter(),
+    sort: rpt.sort
+  }, token);
   return {
     rows: attrs.rows || [],
     totalCount: attrs.total_count || 0,
@@ -255,9 +400,11 @@ async function fetchReport(token) {
 // ===================== CELL FORMATTING =====================
 
 function fmtCell(r, col) {
+  if (col.render) return col.render(r);
   const val = r[col.idx];
   if (col.format === 'date') return fmtDate(val);
   if (col.format === 'time') return fmtTime(val);
+  if (col.format === 'currency') return fmtCurrency(val);
   if (col.link) {
     const href = col.link(r);
     return `<a href="${href}" target="_blank">${esc(val)}</a>`;
@@ -266,9 +413,11 @@ function fmtCell(r, col) {
 }
 
 function fmtCellPlain(r, col) {
+  if (col.renderPlain) return col.renderPlain(r);
   const val = r[col.idx];
   if (col.format === 'date') return fmtDate(val);
   if (col.format === 'time') return fmtTime(val);
+  if (col.format === 'currency') return fmtCurrency(val);
   if (val == null) return '—';
   return String(val);
 }
@@ -289,11 +438,7 @@ function buildHtmlTable() {
     html += `<tr>`;
     for (const col of rpt.columns) {
       const align = col.align ? ` style="text-align:${col.align}"` : '';
-      const val = r[col.idx];
-      const display = col.format === 'date' ? fmtDate(val)
-        : col.format === 'time' ? fmtTime(val)
-        : (val == null ? '—' : String(val));
-      html += `<td${align}>${display}</td>`;
+      html += `<td${align}>${fmtCellPlain(r, col)}</td>`;
     }
     html += `</tr>`;
   }
@@ -498,6 +643,14 @@ function renderPanel(status) {
   td a:hover { text-decoration:underline; }
   .num { text-align:center; }
   .num-zero { text-align:center; color:#555; }
+  .cls {
+    display:inline-block; padding:2px 7px; border-radius:3px;
+    font-size:10px; font-weight:600; letter-spacing:0.3px; white-space:nowrap;
+  }
+  .cls-collect { background:rgba(80,180,120,0.18); color:#7ed4a0; }
+  .cls-collect-partial { background:rgba(240,180,80,0.18); color:#f5c878; }
+  .cls-cleanup { background:rgba(120,140,200,0.18); color:#9ab0e0; }
+  .cls-cleanup-refund { background:rgba(220,120,120,0.18); color:#e89090; }
   .warn { color:#f0a040; font-size:12px; padding:4px 14px; background:#2a2520; }
   .divider { width:1px; height:20px; background:#444; margin:0 4px; }
   .footer {
