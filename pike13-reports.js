@@ -1,9 +1,9 @@
-// Pike13 Reports v1.5 - Multi-report tool + HTML / Slack mrkdwn / Slack Canvas markdown copy formats
+// Pike13 Reports v1.6 - Multi-report tool + HTML / Slack mrkdwn / Slack Canvas markdown copy formats; explanation as flowing prose
 (function() {
 'use strict';
 
 const PANEL_ID = 'pike13-reports';
-const VERSION = '1.5';
+const VERSION = '1.6';
 const BUILD_DATE = '2026-04-08';
 const SUBDOMAIN = location.hostname.split('.')[0];
 const BASE = location.origin;
@@ -172,51 +172,16 @@ const REPORTS = [
       return `Unpaid Invoice Triage – ${today}`;
     },
     // Plain-text summary prepended when "Include summary" is checked.
-    // Reads from the module-level `rows` variable populated by the customFetch.
+    // Returns flowing prose paragraphs separated by blank lines, with no
+    // hardcoded line breaks inside paragraphs — each paragraph wraps naturally
+    // based on the rendering surface's width. Used by all three copy formats.
     buildExplanation: () => {
       if (rows.length === 0) return '';
       const cats = {
         'COLLECT':           { count: 0, owed: 0, desc: 'active customers owe — chase' },
-        'COLLECT (partial)': { count: 0, owed: 0, desc: 'active customers, partial paid' },
-        'CLEANUP':           { count: 0, owed: 0, desc: 'no active plan — safe to cancel' },
-        'CLEANUP (refund)':  { count: 0, owed: 0, desc: 'no active plan, payment to refund first' },
-      };
-      let totalOwed = 0;
-      let urgentCount = 0;
-      let urgentOwed = 0;
-      for (const r of rows) {
-        const cls = r[0], owedC = r[5], autobill = r[10], failedTx = r[11];
-        if (cats[cls]) { cats[cls].count++; cats[cls].owed += owedC; }
-        totalOwed += owedC;
-        if (autobill === 'yes' && failedTx >= 3) { urgentCount++; urgentOwed += owedC; }
-      }
-      const fmt$ = c => '$' + (c / 100).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-      const labels = Object.keys(cats).filter(l => cats[l].count > 0);
-      const labelW = Math.max(...labels.map(l => l.length));
-      const countW = Math.max(...labels.map(l => String(cats[l].count).length));
-      const moneyW = Math.max(...labels.map(l => fmt$(cats[l].owed).length));
-      const lines = [];
-      lines.push(`${rows.length} past-due invoices, ${fmt$(totalOwed)} outstanding total.`);
-      lines.push('');
-      for (const l of labels) {
-        const c = cats[l];
-        lines.push(`  ${l.padEnd(labelW)}  ${String(c.count).padStart(countW)}  ${fmt$(c.owed).padStart(moneyW)}    ${c.desc}`);
-      }
-      if (urgentCount > 0) {
-        lines.push('');
-        lines.push(`${urgentCount} of these have failed autobills (${fmt$(urgentOwed)}) — these are the urgent ones; the cards on file are declining and the customers likely don't realize.`);
-      }
-      return lines.join('\n');
-    },
-    // GFM-formatted version of the summary for Slack Canvas — uses a real
-    // markdown table and bold callout instead of monospace alignment.
-    buildExplanationMarkdown: () => {
-      if (rows.length === 0) return '';
-      const cats = {
-        'COLLECT':           { count: 0, owed: 0, desc: 'active customers owe — chase' },
-        'COLLECT (partial)': { count: 0, owed: 0, desc: 'active customers, partial paid' },
-        'CLEANUP':           { count: 0, owed: 0, desc: 'no active plan — safe to cancel' },
-        'CLEANUP (refund)':  { count: 0, owed: 0, desc: 'no active plan, payment to refund first' },
+        'COLLECT (partial)': { count: 0, owed: 0, desc: 'partial paid' },
+        'CLEANUP':           { count: 0, owed: 0, desc: 'no active plan, safe to cancel' },
+        'CLEANUP (refund)':  { count: 0, owed: 0, desc: 'no active plan, refund first' },
       };
       let totalOwed = 0, urgentCount = 0, urgentOwed = 0;
       for (const r of rows) {
@@ -227,17 +192,21 @@ const REPORTS = [
       }
       const fmt$ = c => '$' + (c / 100).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
       const labels = Object.keys(cats).filter(l => cats[l].count > 0);
-      let md = `**${rows.length} past-due invoices, ${fmt$(totalOwed)} outstanding total.**\n\n`;
-      md += '| Category | Count | Outstanding | Description |\n';
-      md += '|---|---:|---:|---|\n';
-      for (const l of labels) {
-        const c = cats[l];
-        md += `| ${l} | ${c.count} | ${fmt$(c.owed)} | ${c.desc} |\n`;
-      }
+
+      // Build the breakdown as a single flowing sentence with proper Oxford-comma joining.
+      const parts = labels.map(l => `${cats[l].count} ${l} (${fmt$(cats[l].owed)}, ${cats[l].desc})`);
+      let breakdown;
+      if (parts.length === 1) breakdown = parts[0];
+      else if (parts.length === 2) breakdown = parts.join(' and ');
+      else breakdown = parts.slice(0, -1).join(', ') + ', and ' + parts[parts.length - 1];
+
+      const paragraphs = [];
+      paragraphs.push(`${rows.length} past-due invoices, ${fmt$(totalOwed)} outstanding total.`);
+      paragraphs.push(`Breakdown: ${breakdown}.`);
       if (urgentCount > 0) {
-        md += `\n🔴 **${urgentCount} of these have failed autobills** (${fmt$(urgentOwed)}) — these are the urgent ones; the cards on file are declining and the customers likely don't realize.\n`;
+        paragraphs.push(`${urgentCount} of these have failed autobills (${fmt$(urgentOwed)}) — these are the urgent ones; the cards on file are declining and the customers likely don't realize.`);
       }
-      return md;
+      return paragraphs.join('\n\n');
     },
     columns: [
       { label: 'Status',         idx: 0, render: r => `<span class="cls ${clsSlug(r[0])}">${esc(r[0])}</span>` },
@@ -499,11 +468,15 @@ function fmtCellPlain(r, col) {
 function buildHtmlTable() {
   const rpt = report();
   let html = `<p style="margin:0 0 8px;font-family:Arial,sans-serif;font-size:14px;font-weight:bold;">${esc(rpt.emailSubject())}</p>`;
-  // Optional summary preamble (toggled by the "Include summary" checkbox)
+  // Optional summary preamble (toggled by the "Include summary" checkbox).
+  // Render each paragraph as a separate <p> so the text wraps naturally
+  // based on the rendering width.
   if (savedExplain[currentReportId] && rpt.buildExplanation) {
     const explanation = rpt.buildExplanation();
     if (explanation) {
-      html += `<pre style="font-family:Consolas,Monaco,'Courier New',monospace;font-size:12px;background:#f7f7f7;padding:10px;border-radius:4px;margin:0 0 12px;border:1px solid #e0e0e0;white-space:pre;">${esc(explanation)}</pre>`;
+      for (const para of explanation.split('\n\n')) {
+        html += `<p style="margin:0 0 8px;font-family:Arial,sans-serif;font-size:13px;">${esc(para)}</p>`;
+      }
     }
   }
   html += `<table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse;font-family:Arial,sans-serif;font-size:13px;">`;
@@ -587,14 +560,15 @@ function buildSlackTable() {
   const title = rpt.emailSubject();
   const noun = rpt.rowNoun || 'row';
   const countLine = `_${rows.length} ${noun}${rows.length !== 1 ? 's' : ''}_`;
-  // Optional summary preamble — placed inside the code block, above the headers,
-  // so the whole message is one cohesive monospace block in Slack.
+  // Optional summary preamble — placed ABOVE the code block as Slack message
+  // text. Slack wraps message paragraphs naturally; placing the prose inside
+  // the code block would force monospace, which makes long lines wrap badly.
   let preamble = '';
   if (savedExplain[currentReportId] && rpt.buildExplanation) {
     const explanation = rpt.buildExplanation();
-    if (explanation) preamble = explanation + '\n\n';
+    if (explanation) preamble = '\n\n' + explanation;
   }
-  return `*${title}*\n${countLine}\n\`\`\`\n${preamble}${headerRow}\n${sep}\n${dataRows.join('\n')}\n\`\`\``;
+  return `*${title}*\n${countLine}${preamble}\n\n\`\`\`\n${headerRow}\n${sep}\n${dataRows.join('\n')}\n\`\`\``;
 }
 
 function buildCanvasMarkdown() {
@@ -610,16 +584,11 @@ function buildCanvasMarkdown() {
   md += `_${rows.length} ${rpt.rowNoun || 'row'}${rows.length !== 1 ? 's' : ''}_\n\n`;
 
   // Optional summary preamble (toggled by the "Include summary" checkbox).
-  // Prefer the markdown variant; fall back to plain text wrapped in a code
-  // block if only buildExplanation is defined.
-  if (savedExplain[currentReportId]) {
-    if (rpt.buildExplanationMarkdown) {
-      const explanation = rpt.buildExplanationMarkdown();
-      if (explanation) md += explanation + '\n\n';
-    } else if (rpt.buildExplanation) {
-      const explanation = rpt.buildExplanation();
-      if (explanation) md += '```\n' + explanation + '\n```\n\n';
-    }
+  // Plain flowing-prose paragraphs render natively as Canvas paragraphs that
+  // wrap based on Canvas width — no markdown table needed for the breakdown.
+  if (savedExplain[currentReportId] && rpt.buildExplanation) {
+    const explanation = rpt.buildExplanation();
+    if (explanation) md += explanation + '\n\n';
   }
 
   // Header + alignment row. Use right-alignment markers (---:) for currency
