@@ -1,6 +1,6 @@
 # Pike13 Reports
 
-Browser bookmarklet for running and sharing Pike13 admin reports. Queries the Reporting API v3 directly, displays results in a draggable dark-theme panel, and copies formatted tables for pasting into Slack or email.
+Browser bookmarklet for running and sharing Pike13 admin reports. Queries the Reporting API v3 directly, displays results in a draggable dark-theme panel, and copies formatted tables for pasting into Slack, Slack Canvas, or email.
 
 ## Reports
 
@@ -45,14 +45,30 @@ Copy the contents of `pike13-reports.js` and paste into the browser console on a
 2. Click the bookmarklet (or paste into console)
 3. Select a report from the dropdown
 4. Adjust date range if needed, click **Apply** (date-based reports only)
-5. **Copy Table** copies a formatted HTML table with a title header to your clipboard
-6. Paste into Slack, email (Roundcube), or a doc
+5. Optionally tick **Include summary** to prepend a category breakdown to the copied output (only shown when the active report defines a summary; currently the Unpaid Invoice Triage report)
+6. Click one of the three copy buttons (see below) to copy the data in the format you need
+7. Paste into the destination
+
+### Choosing a copy format
+
+| Button | Format | Best for | Notes |
+|---|---|---|---|
+| **📋 HTML** | HTML `<table>` | Email (Roundcube), Google Docs, Outlook, any rich-text destination | Renders as a proper HTML table. The original copy format. |
+| **💬 Slack** | Slack mrkdwn with monospace code block | Short tables in a Slack message | Slack messages have a 4,000-character limit and code blocks wrap at narrow widths, so this format only works for small tables. The Unpaid Invoice Triage report's full output exceeds the limit; use Canvas for that. |
+| **📝 Canvas** | GitHub-flavored Markdown | Any size table being pasted into a Slack Canvas | Canvas renders real markdown tables as actual HTML tables, with no width or character-count restrictions. The right choice for the Unpaid Invoice Triage report. |
 
 ### Email workflow
 
 1. Enter a recipient address (defaults are pre-filled per report)
-2. Click **Email** — copies the table and opens Roundcube compose with To/Subject filled
+2. Click **Email** — copies the HTML table and opens Roundcube compose with To/Subject filled
 3. Ctrl+V to paste the table into the email body
+
+### Slack Canvas workflow
+
+1. Click **📝 Canvas** to copy the markdown
+2. Open Slack and navigate to the channel or DM where you want the canvas
+3. Click the **+** button near the message input and choose **Create a canvas** (or open an existing channel canvas)
+4. Paste — the markdown renders as a real table immediately
 
 ## Requirements
 
@@ -66,8 +82,10 @@ Copy the contents of `pike13-reports.js` and paste into the browser console on a
 - Draggable, minimizes to pill
 - Per-report date pickers with saved state (date-based reports only)
 - Per-report email defaults
+- Per-report **Include summary** preamble (prepended to copied output as flowing prose paragraphs)
 - Read-only filter tags showing active query criteria
 - Color-coded status badges and inline currency formatting
+- Three copy formats: HTML for email, Slack mrkdwn for Slack messages, Canvas markdown for Slack Canvas
 - Domain guard (alerts if run from wrong site)
 - Descriptive error messages for auth failures
 
@@ -77,12 +95,18 @@ Each report is defined as a config object in the `REPORTS` array. Date-based rep
 
 Reports needing multi-phase queries with client-side joins (currently just Unpaid Invoice Triage) provide a `customFetch(token, queryV3)` hook instead of `slug`/`fields`/`getFilter`/`sort`. The hook receives the auth token and the shared `queryV3` helper, runs whatever sequence of API calls it needs, and returns rows in the standard `{ rows, totalCount, hasMore }` shape — the rest of the framework treats them identically.
 
-Column definitions support `format: 'date' | 'time' | 'currency'`, link callbacks, and per-column `render(r)` / `renderPlain(r)` callbacks for custom HTML or plain-text output. The `render` callback is used by the triage report for the colored status badge and the color-graded fail count.
+Reports can optionally provide a `buildExplanation()` hook that returns plain-text flowing-prose paragraphs (separated by `\n\n`, no hardcoded internal line breaks). When the **Include summary** checkbox is ticked, each format builder places those paragraphs natively: HTML wraps them in `<p>` elements, Slack mrkdwn places them in the message body above the code block, and Canvas markdown emits them as ordinary paragraphs above the data table. The checkbox only appears when the active report defines `buildExplanation`.
+
+Column definitions support `format: 'date' | 'time' | 'currency'`, link callbacks, per-column `render(r)` / `renderPlain(r)` callbacks for custom HTML or plain-text output, and an optional `slackMax: N` for length-truncating long cells in the Slack mrkdwn format only. The `render` callback is used by the triage report for the colored status badge and the color-graded fail count.
 
 ## Version History
 
 | Version | Date | Notes |
 |---|---|---|
+| 1.6 | 2026-04-08 | Rewrote the **Include summary** preamble as flowing prose paragraphs instead of a pseudo-table with monospace column padding. The earlier layout depended on the rendering surface using a fixed-width font and respecting literal whitespace, which broke outside code blocks. Each builder now places the paragraphs as native paragraphs of its target format. The Slack mrkdwn output places the explanation in the message body above the code block instead of injecting it inside, so it wraps to message bubble width naturally. |
+| 1.5 | 2026-04-08 | Added **📝 Canvas** copy button producing GitHub-flavored Markdown for pasting into a Slack Canvas. Slack messages can't render the full Unpaid Invoice Triage table due to the 4,000-character message limit and code-block wrapping issues; Canvas sidesteps both by rendering real markdown tables as actual HTML tables. |
+| 1.4 | 2026-04-08 | Renamed "📋 Copy Table" to "📋 HTML" with an explicit format label and tooltip. Added an **Include summary** checkbox (between the copy buttons and Refresh) that prepends a category breakdown to the copied output when the active report defines a `buildExplanation()` hook. Currently wired up for Unpaid Invoice Triage. State persists per report. |
+| 1.3 | 2026-04-08 | Added **💬 Slack** copy button producing Slack mrkdwn with a monospace code block. Useful for short tables; wide tables don't render reliably in Slack messages and should use the Canvas format instead (added in v1.5). |
 | 1.2 | 2026-04-08 | Added **Unpaid Invoice Triage** as third report. Framework extended with `customFetch` hook for multi-phase queries; `queryV3()` extracted as a shared helper; column system gained `render` callbacks and `currency` format. |
 | 1.1 | 2026-04-02 | Dark-themed date pickers, dimmed zero values, label contrast improvements. |
 | 1.0 | 2026-04-02 | Initial release. Declined Payments + Post-assessment reports. |
