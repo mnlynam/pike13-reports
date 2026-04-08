@@ -1,9 +1,9 @@
-// Pike13 Reports v1.2 - Multi-report tool (Declined Payments, Post-assessment, Unpaid Invoice Triage)
+// Pike13 Reports v1.4 - Multi-report tool + HTML/Slack mrkdwn copy formats + optional summary preamble
 (function() {
 'use strict';
 
 const PANEL_ID = 'pike13-reports';
-const VERSION = '1.2';
+const VERSION = '1.4';
 const BUILD_DATE = '2026-04-08';
 const SUBDOMAIN = location.hostname.split('.')[0];
 const BASE = location.origin;
@@ -171,6 +171,43 @@ const REPORTS = [
       const today = new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
       return `Unpaid Invoice Triage – ${today}`;
     },
+    // Plain-text summary prepended when "Include summary" is checked.
+    // Reads from the module-level `rows` variable populated by the customFetch.
+    buildExplanation: () => {
+      if (rows.length === 0) return '';
+      const cats = {
+        'COLLECT':           { count: 0, owed: 0, desc: 'active customers owe — chase' },
+        'COLLECT (partial)': { count: 0, owed: 0, desc: 'active customers, partial paid' },
+        'CLEANUP':           { count: 0, owed: 0, desc: 'no active plan — safe to cancel' },
+        'CLEANUP (refund)':  { count: 0, owed: 0, desc: 'no active plan, payment to refund first' },
+      };
+      let totalOwed = 0;
+      let urgentCount = 0;
+      let urgentOwed = 0;
+      for (const r of rows) {
+        const cls = r[0], owedC = r[5], autobill = r[10], failedTx = r[11];
+        if (cats[cls]) { cats[cls].count++; cats[cls].owed += owedC; }
+        totalOwed += owedC;
+        if (autobill === 'yes' && failedTx >= 3) { urgentCount++; urgentOwed += owedC; }
+      }
+      const fmt$ = c => '$' + (c / 100).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+      const labels = Object.keys(cats).filter(l => cats[l].count > 0);
+      const labelW = Math.max(...labels.map(l => l.length));
+      const countW = Math.max(...labels.map(l => String(cats[l].count).length));
+      const moneyW = Math.max(...labels.map(l => fmt$(cats[l].owed).length));
+      const lines = [];
+      lines.push(`${rows.length} past-due invoices, ${fmt$(totalOwed)} outstanding total.`);
+      lines.push('');
+      for (const l of labels) {
+        const c = cats[l];
+        lines.push(`  ${l.padEnd(labelW)}  ${String(c.count).padStart(countW)}  ${fmt$(c.owed).padStart(moneyW)}    ${c.desc}`);
+      }
+      if (urgentCount > 0) {
+        lines.push('');
+        lines.push(`${urgentCount} of these have failed autobills (${fmt$(urgentOwed)}) — these are the urgent ones; the cards on file are declining and the customers likely don't realize.`);
+      }
+      return lines.join('\n');
+    },
     columns: [
       { label: 'Status',         idx: 0, render: r => `<span class="cls ${clsSlug(r[0])}">${esc(r[0])}</span>` },
       { label: 'Client',         idx: 3, link: r => `${BASE}/people/${r[4]}` },
@@ -184,7 +221,7 @@ const REPORTS = [
         if (v > 0) return `<span style="color:#f5c878">${v}</span>`;
         return `<span style="color:#555">${v}</span>`;
       }},
-      { label: 'Recommendation', idx: 12 },
+      { label: 'Recommendation', idx: 12, slackMax: 50 },
     ],
     customFetch: async (token, queryV3) => {
       // Phase 1: invoices matching /today/unpaid_invoices (KL #235)
@@ -323,6 +360,10 @@ dateEnd = _initDates.end;
 const savedEmails = {};
 REPORTS.forEach(r => { savedEmails[r.id] = r.defaultEmail || ''; });
 
+// Per-report "Include summary" checkbox state — defaults to false
+const savedExplain = {};
+REPORTS.forEach(r => { savedExplain[r.id] = false; });
+
 function report() { return REPORTS.find(r => r.id === currentReportId); }
 
 // ===================== AUTH =====================
@@ -427,6 +468,13 @@ function fmtCellPlain(r, col) {
 function buildHtmlTable() {
   const rpt = report();
   let html = `<p style="margin:0 0 8px;font-family:Arial,sans-serif;font-size:14px;font-weight:bold;">${esc(rpt.emailSubject())}</p>`;
+  // Optional summary preamble (toggled by the "Include summary" checkbox)
+  if (savedExplain[currentReportId] && rpt.buildExplanation) {
+    const explanation = rpt.buildExplanation();
+    if (explanation) {
+      html += `<pre style="font-family:Consolas,Monaco,'Courier New',monospace;font-size:12px;background:#f7f7f7;padding:10px;border-radius:4px;margin:0 0 12px;border:1px solid #e0e0e0;white-space:pre;">${esc(explanation)}</pre>`;
+    }
+  }
   html += `<table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse;font-family:Arial,sans-serif;font-size:13px;">`;
   html += `<tr style="background:#f0f0f0;font-weight:bold;">`;
   for (const col of rpt.columns) {
@@ -449,11 +497,73 @@ function buildHtmlTable() {
 function buildPlainTable() {
   const rpt = report();
   let txt = rpt.emailSubject() + '\n\n';
+  if (savedExplain[currentReportId] && rpt.buildExplanation) {
+    const explanation = rpt.buildExplanation();
+    if (explanation) txt += explanation + '\n\n';
+  }
   txt += rpt.columns.map(c => c.label).join('\t') + '\n';
   for (const r of rows) {
     txt += rpt.columns.map(c => fmtCellPlain(r, c)).join('\t') + '\n';
   }
   return txt;
+}
+
+function buildSlackTable() {
+  // Produces a Slack-friendly message: bold title + row count + a triple-backtick
+  // code block with column-aligned monospace text. Slack renders code blocks in
+  // a fixed-width font, which is the only way to get tabular data to display as
+  // a grid in a Slack message (regular HTML tables get stripped on paste).
+  const rpt = report();
+  if (rows.length === 0) return '';
+  const ELLIPSIS = '…';
+
+  // Extract plain-text cell values, stripping any residual HTML and
+  // applying per-column slackMax truncation.
+  const cells = rows.map(r => rpt.columns.map(c => {
+    let val = fmtCellPlain(r, c);
+    val = val.replace(/<[^>]+>/g, '');
+    if (c.slackMax && val.length > c.slackMax) {
+      val = val.slice(0, c.slackMax - 1) + ELLIPSIS;
+    }
+    return val;
+  }));
+  const headers = rpt.columns.map(c => c.label);
+
+  // Auto-size each column to the widest of its header and all cells.
+  const widths = headers.map((h, i) => {
+    let w = h.length;
+    for (const row of cells) w = Math.max(w, row[i].length);
+    return w;
+  });
+
+  // Alignment: right-align numeric/currency, center-align center cols, left-align rest.
+  const align = (text, width, col) => {
+    if (col.format === 'currency' || col.align === 'right') return text.padStart(width);
+    if (col.align === 'center') {
+      const pad = width - text.length;
+      const left = Math.floor(pad / 2);
+      return ' '.repeat(left) + text + ' '.repeat(pad - left);
+    }
+    return text.padEnd(width);
+  };
+
+  const headerRow = headers.map((h, i) => align(h, widths[i], rpt.columns[i])).join('  ');
+  const sep = widths.map(w => '─'.repeat(w)).join('  ');
+  const dataRows = cells.map(row =>
+    row.map((cell, i) => align(cell, widths[i], rpt.columns[i])).join('  ')
+  );
+
+  const title = rpt.emailSubject();
+  const noun = rpt.rowNoun || 'row';
+  const countLine = `_${rows.length} ${noun}${rows.length !== 1 ? 's' : ''}_`;
+  // Optional summary preamble — placed inside the code block, above the headers,
+  // so the whole message is one cohesive monospace block in Slack.
+  let preamble = '';
+  if (savedExplain[currentReportId] && rpt.buildExplanation) {
+    const explanation = rpt.buildExplanation();
+    if (explanation) preamble = explanation + '\n\n';
+  }
+  return `*${title}*\n${countLine}\n\`\`\`\n${preamble}${headerRow}\n${sep}\n${dataRows.join('\n')}\n\`\`\``;
 }
 
 async function copyTableToClipboard() {
@@ -476,6 +586,29 @@ async function copyTableToClipboard() {
     document.execCommand('copy');
     ta.remove();
     return true;
+  }
+}
+
+async function copyForSlack() {
+  if (rows.length === 0) { showToast('⚠ Nothing to copy'); return; }
+  const text = buildSlackTable();
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch (e) {
+    console.warn('Slack clipboard write failed, falling back:', e);
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand('copy');
+    ta.remove();
+  }
+  const charCount = text.length.toLocaleString();
+  const overLimit = text.length > 12000;
+  if (overLimit) {
+    showToast(`✓ Copied for Slack (${charCount} chars — may exceed Slack message limit)`, true);
+  } else {
+    showToast(`✓ Copied for Slack — paste into Slack message (${charCount} chars)`);
   }
 }
 
@@ -586,6 +719,15 @@ function renderPanel(status) {
     font-family:inherit; color-scheme:dark;
   }
   .toolbar input:focus { outline:none; border-color:#667eea; }
+  .checkbox-label {
+    display:flex; align-items:center; gap:5px;
+    color:#aaa; font-size:11px; cursor:pointer; user-select:none;
+    padding:4px 6px; border-radius:4px;
+  }
+  .checkbox-label:hover { color:#ddd; background:rgba(255,255,255,0.04); }
+  .checkbox-label input[type="checkbox"] {
+    margin:0; cursor:pointer; accent-color:#667eea;
+  }
   .btn {
     padding:5px 12px; border-radius:5px; border:none;
     font-size:12px; font-weight:500; cursor:pointer;
@@ -691,7 +833,13 @@ function renderPanel(status) {
   </div>
   ${isMinimized ? '' : `
   <div class="toolbar">
-    <button class="btn btn-pri" id="btn-copy" ${rows.length === 0 ? 'disabled' : ''}>📋 Copy Table</button>
+    <button class="btn btn-pri" id="btn-copy" ${rows.length === 0 ? 'disabled' : ''} title="Copy as HTML table — paste into email or any rich-text destination">📋 HTML</button>
+    <button class="btn btn-pri" id="btn-copy-slack" ${rows.length === 0 ? 'disabled' : ''} title="Copy as Slack mrkdwn message with monospace code block — paste into a Slack message">💬 Slack</button>
+    ${rpt.buildExplanation ? `
+    <label class="checkbox-label" title="Prepend a category breakdown / totals to the copied output">
+      <input type="checkbox" id="rpt-include-explain" ${savedExplain[currentReportId] ? 'checked' : ''} />
+      Include summary
+    </label>` : ''}
     <button class="btn btn-sec" id="btn-refresh">↻ Refresh</button>
     <span class="divider"></span>
     <label>To:</label>
@@ -738,7 +886,11 @@ function renderPanel(status) {
   shadow.getElementById('btn-email')?.addEventListener('click', emailReport);
   shadow.getElementById('btn-copy')?.addEventListener('click', async () => {
     await copyTableToClipboard();
-    showToast('✓ Table copied to clipboard');
+    showToast('✓ HTML table copied — paste into email or rich-text');
+  });
+  shadow.getElementById('btn-copy-slack')?.addEventListener('click', copyForSlack);
+  shadow.getElementById('rpt-include-explain')?.addEventListener('change', e => {
+    savedExplain[currentReportId] = e.target.checked;
   });
   shadow.getElementById('btn-refresh')?.addEventListener('click', () => {
     const emailEl = shadow.querySelector('#rpt-email');
