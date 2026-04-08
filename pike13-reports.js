@@ -1,9 +1,9 @@
-// Pike13 Reports v1.6 - Multi-report tool + HTML / Slack mrkdwn / Slack Canvas markdown copy formats; explanation as flowing prose
+// Pike13 Reports v1.7 - Multi-report tool + HTML / Slack mrkdwn / Slack Canvas markdown copy formats; corrected Slack 4000-char warning
 (function() {
 'use strict';
 
 const PANEL_ID = 'pike13-reports';
-const VERSION = '1.6';
+const VERSION = '1.7';
 const BUILD_DATE = '2026-04-08';
 const SUBDOMAIN = location.hostname.split('.')[0];
 const BASE = location.origin;
@@ -653,9 +653,12 @@ async function copyForSlack() {
     ta.remove();
   }
   const charCount = text.length.toLocaleString();
-  const overLimit = text.length > 12000;
+  // Slack's per-message compose limit is 4,000 characters. Messages over this
+  // can't be sent — Slack shows an overflow badge in the compose box. v1.6 had
+  // this set to 12000 which never fired in the danger zone.
+  const overLimit = text.length > 4000;
   if (overLimit) {
-    showToast(`✓ Copied for Slack (${charCount} chars — may exceed Slack message limit)`, true);
+    showToast(`⚠ Copied ${charCount} chars — exceeds Slack's 4,000-char message limit. Use 📝 Canvas instead for tables this large.`, true);
   } else {
     showToast(`✓ Copied for Slack — paste into Slack message (${charCount} chars)`);
   }
@@ -900,7 +903,7 @@ function renderPanel(status) {
   ${isMinimized ? '' : `
   <div class="toolbar">
     <button class="btn btn-pri" id="btn-copy" ${rows.length === 0 ? 'disabled' : ''} title="Copy as HTML table — paste into email or any rich-text destination">📋 HTML</button>
-    <button class="btn btn-pri" id="btn-copy-slack" ${rows.length === 0 ? 'disabled' : ''} title="Copy as Slack mrkdwn message with monospace code block — paste into a Slack message (best for short tables; may not render correctly for wide ones)">💬 Slack</button>
+    <button class="btn btn-pri" id="btn-copy-slack" ${rows.length === 0 ? 'disabled' : ''} title="Copy as Slack mrkdwn with monospace code block — paste into a Slack message. Best for short tables under 4,000 characters; wide tables (like Unpaid Invoice Triage) won't fit and won't render correctly. Use 📝 Canvas instead for those.">💬 Slack</button>
     <button class="btn btn-pri" id="btn-copy-canvas" ${rows.length === 0 ? 'disabled' : ''} title="Copy as GitHub-flavored Markdown — paste into a Slack Canvas to render as a real table">📝 Canvas</button>
     ${rpt.buildExplanation ? `
     <label class="checkbox-label" title="Prepend a category breakdown / totals to the copied output">
