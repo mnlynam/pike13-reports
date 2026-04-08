@@ -1,9 +1,9 @@
-// Pike13 Reports v1.8 - Removed redundant Canvas button (HTML paste does the same thing); human-readable duration formatting
+// Pike13 Reports v1.9 - Client + Invoice links preserved in HTML clipboard output (email / Slack Canvas / Google Docs)
 (function() {
 'use strict';
 
 const PANEL_ID = 'pike13-reports';
-const VERSION = '1.8';
+const VERSION = '1.9';
 const BUILD_DATE = '2026-04-08';
 const SUBDOMAIN = location.hostname.split('.')[0];
 const BASE = location.origin;
@@ -485,6 +485,24 @@ function fmtCellPlain(r, col) {
   return String(val);
 }
 
+// Used by buildHtmlTable for clipboard output — same as fmtCellPlain but
+// preserves links on columns that define a `link` callback. Does NOT invoke
+// the `render` callbacks (which produce panel-internal HTML with CSS classes
+// that won't carry over to email/Canvas destinations); instead it prefers
+// `renderPlain` when available, falling back to the val-based formatters.
+function fmtCellClipboardHtml(r, col) {
+  if (col.renderPlain) return esc(col.renderPlain(r));
+  const val = r[col.idx];
+  if (col.format === 'date') return esc(fmtDate(val));
+  if (col.format === 'time') return esc(fmtTime(val));
+  if (col.format === 'currency') return esc(fmtCurrency(val));
+  if (col.link) {
+    const href = col.link(r);
+    return `<a href="${esc(href)}">${esc(val)}</a>`;
+  }
+  return esc(val);
+}
+
 // ===================== CLIPBOARD / EMAIL =====================
 
 function buildHtmlTable() {
@@ -512,7 +530,7 @@ function buildHtmlTable() {
     html += `<tr>`;
     for (const col of rpt.columns) {
       const align = col.align ? ` style="text-align:${col.align}"` : '';
-      html += `<td${align}>${fmtCellPlain(r, col)}</td>`;
+      html += `<td${align}>${fmtCellClipboardHtml(r, col)}</td>`;
     }
     html += `</tr>`;
   }
