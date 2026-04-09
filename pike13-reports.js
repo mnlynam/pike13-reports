@@ -1,9 +1,9 @@
-// Pike13 Reports v1.11 - Duration normalization fixes, 14-day threshold, dash and multiplication-sign purge, formatted human-written summary
+// Pike13 Reports v1.12 - UIT classifier rebuilt: plan_id join, 3-year cutoff, account-activity check, two-class flattening with separate Modifiers column
 (function() {
 'use strict';
 
 const PANEL_ID = 'pike13-reports';
-const VERSION = '1.11';
+const VERSION = '1.12';
 const BUILD_DATE = '2026-04-08';
 const SUBDOMAIN = location.hostname.split('.')[0];
 const BASE = location.origin;
@@ -46,14 +46,8 @@ function fmtCurrency(cents) {
   return '$' + (Number(cents) / 100).toFixed(2);
 }
 
-// Convert a raw day count to a human-readable duration with up to two units.
-// Under 14 days: raw day count (e.g. "3d", "13d"). 14-29 days: weeks plus
-// leftover days (e.g. "2w", "2w 3d"). 30-364 days: months plus leftover weeks
-// (e.g. "3mo", "5mo 1w"). 365+ days: years plus leftover months (e.g. "2y",
-// "8y 5mo"). Approximations: 1 month = 30 days, 1 year = 365 days. The >=4w
-// and >=12mo normalizations prevent edge cases like "6mo 4w" (which should be
-// "7mo") or "1y 12mo" (which should be "2y") that the naive modular math
-// would otherwise produce.
+// Convert a raw day count to a human-readable duration. See v1.11 for the
+// full rationale and edge case notes.
 function fmtDuration(days) {
   if (days == null) return '';
   const d = Math.abs(Math.floor(Number(days)));
@@ -77,6 +71,16 @@ function fmtDuration(days) {
 
 function clsSlug(s) {
   return 'cls-' + String(s).toLowerCase().replace(/[^a-z]+/g, '-').replace(/^-|-$/g, '');
+}
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+// Run an async function over a list of items with bounded concurrency.
+async function runConcurrent(items, concurrency, fn) {
+  for (let i = 0; i < items.length; i += concurrency) {
+    const chunk = items.slice(i, i + concurrency);
+    await Promise.all(chunk.map(fn));
+  }
 }
 
 // ===================== REPORT DEFINITIONS =====================
@@ -120,7 +124,7 @@ const REPORTS = [
       return `Declined Payments Report for ${m}`;
     },
     emptyMsg: 'No declined payments found.',
-    loadingMsg: 'Fetching declined payments…',
+    loadingMsg: 'Fetching declined payments...',
     defaultEmail: 'lcaploe@musicplace.com',
     dateRange: true,
     defaultDates: () => {
@@ -130,7 +134,7 @@ const REPORTS = [
         end: fmtDateISO(t)
       };
     },
-    filterTags: () => ['Failed transactions > 0', 'Status ≠ closed', 'Status ≠ canceled'],
+    filterTags: () => ['Failed transactions > 0', 'Status not closed', 'Status not canceled'],
   },
   {
     id: 'post_assessment',
@@ -171,7 +175,7 @@ const REPORTS = [
       return `Post-assessment Report for ${f(dateStart)} to ${f(dateEnd)}`;
     },
     emptyMsg: 'No incomplete assessments found.',
-    loadingMsg: 'Fetching assessments…',
+    loadingMsg: 'Fetching assessments...',
     defaultEmail: 'jmorris@musicplace.com',
     dateRange: true,
     defaultDates: () => {
@@ -184,69 +188,102 @@ const REPORTS = [
     filterTags: () => ['Personalized Aptitude Assessment', 'Attendance not completed', 'Not internal'],
   },
   {
-    // ===== Unpaid Invoice Triage =====
-    // Replicates /today/unpaid_invoices and classifies each row as collections-worthy
-    // or cleanup-eligible by joining invoice line items to the business-wide active plan set.
-    // Three batch report calls, zero per-invoice fetches. ~2 seconds for ~100 invoices.
+    // ===== Unpaid Invoice Triage (v1.12 rebuild) =====
+    // Rebuilt classification pipeline (ported from pike13-invoice-cleanup v1.08):
+    //   1. Pull invoice_items with plan_id (undocumented but accepted v3 field)
+    //   2. Pull person_plans for the linked plan_ids only (or-eq filter shape;
+    //      'in' shape is rejected)
+    //   3. Fetch dependents for each unique payer via desk API (parallelized
+    //      at concurrency 5)
+    //   4. Pull clients.last_visit_date for payers + dependents
+    //   5. Pull recent transactions filtered by invoice_payer_id and
+    //      transaction_date > 3 years ago
+    //   6. Classify each invoice as COLLECT or CLEANUP with modifier tags
+    //
+    // Two-class flattening: every row is either COLLECT or CLEANUP at the
+    // top level. Sub-types live in a separate Modifiers column. The promotion
+    // rule: any account with recent activity (visits or payments by the payer
+    // or their dependents in the last 3 years) is COLLECT regardless of plan
+    // age, including refund-required cases. Refund cases promote to COLLECT
+    // because the customer is reachable and the service was delivered.
     id: 'unpaid_triage',
     name: 'Unpaid Invoice Triage',
     rowNoun: 'invoice',
-    emptyMsg: 'No past-due invoices found. 🎉',
-    loadingMsg: 'Triaging unpaid invoices…',
+    emptyMsg: 'No past-due invoices found.',
+    loadingMsg: 'Triaging unpaid invoices (this may take 30-60 seconds)...',
     defaultEmail: 'lcaploe@musicplace.com',
     dateRange: false,
-    filterTags: () => ['Matches /today/unpaid_invoices', 'Joined to business-wide active plans'],
+    filterTags: () => ['Matches /today/unpaid_invoices', 'Joined to plan records by plan_id', '3-year cutoff', 'Activity check on payer + dependents'],
     emailSubject: () => {
       const today = new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
       return `Unpaid Invoice Triage for ${today}`;
     },
-    // Returns a structured array of content blocks for the summary preamble,
-    // written as a short human-readable report: an intro sentence, a labeled
-    // bullet list of categories, and (if applicable) an urgent-subset callout.
-    // Each builder renders the blocks into its own output format. HTML wraps
-    // each paragraph in <p> and each list in <ul><li>, and the plain-text and
-    // Slack-mrkdwn outputs render bullets with a bullet character.
     buildExplanation: () => {
       if (rows.length === 0) return [];
       const cats = {
-        'COLLECT':           { count: 0, owed: 0, desc: 'active customers who still owe. Chase these.' },
-        'COLLECT (partial)': { count: 0, owed: 0, desc: 'active customers, partial payment received. Collect the balance.' },
-        'CLEANUP':           { count: 0, owed: 0, desc: 'no active plan linked. Safe to cancel.' },
-        'CLEANUP (refund)':  { count: 0, owed: 0, desc: 'no active plan, payment on file. Refund first, then cancel.' },
+        'COLLECT': { count: 0, owed: 0 },
+        'CLEANUP': { count: 0, owed: 0 },
       };
+      const modifierCounts = {};
       let totalOwed = 0, urgentCount = 0, urgentOwed = 0;
       for (const r of rows) {
-        const cls = r[0], owedC = r[5], autobill = r[10], failedTx = r[11];
+        const cls = r[0], owedC = r[5], autobill = r[10], failedTx = r[11], modifiers = r[13] || [];
         if (cats[cls]) { cats[cls].count++; cats[cls].owed += owedC; }
         totalOwed += owedC;
+        for (const m of modifiers) {
+          modifierCounts[m] = (modifierCounts[m] || 0) + 1;
+        }
         if (autobill === 'yes' && failedTx >= 3) { urgentCount++; urgentOwed += owedC; }
       }
       const fmt$ = c => '$' + (c / 100).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-      const labels = Object.keys(cats).filter(l => cats[l].count > 0);
 
       const blocks = [];
       blocks.push({
         type: 'paragraph',
         text: `${rows.length} past-due invoices in the queue today, totaling ${fmt$(totalOwed)} outstanding.`
       });
-      blocks.push({
-        type: 'list',
-        intro: 'How they break down:',
-        items: labels.map(l => {
-          const c = cats[l];
-          return `${c.count} ${l} (${fmt$(c.owed)}): ${c.desc}`;
-        })
-      });
+
+      const items = [];
+      if (cats.COLLECT.count > 0) {
+        items.push(`${cats.COLLECT.count} COLLECT (${fmt$(cats.COLLECT.owed)}): customers are reachable, follow up to collect.`);
+      }
+      if (cats.CLEANUP.count > 0) {
+        items.push(`${cats.CLEANUP.count} CLEANUP (${fmt$(cats.CLEANUP.owed)}): customers are gone, safe to write off.`);
+      }
+      blocks.push({ type: 'list', intro: 'How they break down:', items });
+
+      // Modifier breakdown if any are present
+      const modifierItems = [];
+      const modifierLabels = {
+        'partial':       'partial-paid (collect the balance)',
+        'old bill':      'old bills, customer still active (gentle follow-up)',
+        'refund needed': 'refund required first (paid invoice on a dead plan)',
+        'non-plan':      'non-plan items (retail, signup fees, etc.)',
+      };
+      for (const key of ['partial', 'old bill', 'refund needed', 'non-plan']) {
+        if (modifierCounts[key]) {
+          modifierItems.push(`${modifierCounts[key]} ${modifierLabels[key]}`);
+        }
+      }
+      if (modifierItems.length > 0) {
+        blocks.push({ type: 'list', intro: 'Modifiers worth noting:', items: modifierItems });
+      }
+
       if (urgentCount > 0) {
         blocks.push({
           type: 'paragraph',
-          text: `${urgentCount} of these have failed autobills totaling ${fmt$(urgentOwed)}. These are the most urgent: the cards on file are declining and the customers probably don't know yet.`
+          text: `${urgentCount} of these have failed autobills totaling ${fmt$(urgentOwed)}. These are the most urgent: the cards on file are declining and the customers probably do not know yet.`
         });
       }
       return blocks;
     },
     columns: [
       { label: 'Status',         idx: 0, render: r => `<span class="cls ${clsSlug(r[0])}">${esc(r[0])}</span>` },
+      { label: 'Modifiers',      idx: 13, render: r => {
+        const mods = r[13] || [];
+        if (mods.length === 0) return '<span style="color:#cbd5e1;">-</span>';
+        return mods.map(m => `<span class="mod mod-${m.replace(/\s+/g, '-')}">${esc(m)}</span>`).join(' ');
+      }, renderPlain: r => (r[13] || []).join(', ') },
       { label: 'Client',         idx: 3, link: r => `${BASE}/people/${r[4]}` },
       { label: 'Invoice',        idx: 1, link: r => `${BASE}/invoices/${r[2]}` },
       { label: 'Owed',           idx: 5, format: 'currency', align: 'right' },
@@ -261,13 +298,18 @@ const REPORTS = [
       { label: 'Recommendation', idx: 12, slackMax: 50 },
     ],
     customFetch: async (token, queryV3) => {
-      // Phase 1: invoices matching /today/unpaid_invoices (KL #235)
-      const invAttrs = await queryV3('invoices', {
+      // Phase 1: invoice_items with plan_id (filtered server-side to past-due
+      // open invoices with positive outstanding amount). Single bulk query.
+      const itemAttrs = await queryV3('invoice_items', {
         page: { limit: 2000 },
         fields: [
-          'invoice_id', 'invoice_number', 'invoice_payer_name', 'invoice_payer_id',
-          'issued_date', 'expected_amount', 'net_paid_amount', 'outstanding_amount',
-          'days_since_invoice_due', 'invoice_autobill', 'failed_transactions'
+          'invoice_id', 'invoice_item_id',
+          'invoice_payer_id', 'invoice_payer_name',
+          'invoice_number', 'issued_date', 'days_since_invoice_due',
+          'product_name', 'product_type',
+          'plan_id',
+          'expected_amount', 'net_paid_amount', 'outstanding_amount',
+          'invoice_autobill', 'failed_transactions'
         ],
         filter: ['and', [
           ['eq', 'invoice_state', 'open'],
@@ -275,83 +317,233 @@ const REPORTS = [
           ['gt', 'days_since_invoice_due', 0]
         ]]
       }, token);
-      const invRows = invAttrs.rows || [];
-      if (invRows.length === 0) return { rows: [], totalCount: 0, hasMore: false };
+      const itemRows = itemAttrs.rows || [];
+      if (itemRows.length === 0) return { rows: [], totalCount: 0, hasMore: false };
 
-      // Phase 2: line items for those invoices, using hidden plan_id field (KL #234)
-      const invIds = invRows.map(r => r[0]);
-      const itemAttrs = await queryV3('invoice_items', {
-        page: { limit: 2000 },
-        fields: ['invoice_id', 'plan_id'],
-        filter: ['or', invIds.map(id => ['eq', 'invoice_id', id])]
-      }, token);
-      const invToPlans = new Map();
-      for (const it of (itemAttrs.rows || [])) {
-        const [invId, planId] = it;
-        if (planId == null) continue;
-        if (!invToPlans.has(invId)) invToPlans.set(invId, []);
-        invToPlans.get(invId).push(planId);
+      // Phase 2: For each unique linked plan_id, pull the plan record.
+      // Uses ['or', [['eq','plan_id', X], ...]] filter shape (the ['in', ...]
+      // shape is rejected). Chunked at 100 plan_ids per query for safety.
+      const linkedPlanIds = [...new Set(itemRows.map(r => r[9]).filter(p => p != null))];
+      const planRows = [];
+      if (linkedPlanIds.length > 0) {
+        const CHUNK = 100;
+        for (let i = 0; i < linkedPlanIds.length; i += CHUNK) {
+          const chunk = linkedPlanIds.slice(i, i + CHUNK);
+          const planAttrs = await queryV3('person_plans', {
+            page: { limit: 200 },
+            fields: ['plan_id', 'plan_name', 'start_date', 'end_date', 'is_canceled', 'is_ended', 'person_id', 'full_name'],
+            filter: ['or', chunk.map(pid => ['eq', 'plan_id', pid])]
+          }, token);
+          planRows.push(...(planAttrs.rows || []));
+        }
+      }
+      const planById = new Map();
+      for (const p of planRows) planById.set(p[0], p);
+
+      // Phase 3: Group line items by invoice
+      const invoiceMap = new Map();
+      for (const row of itemRows) {
+        const [invId, itemId, payerId, payerName, invNum, issued, daysSince, productName, productType, planId, expectedC, paidC, owedC, autobill, failedTx] = row;
+        if (!invoiceMap.has(invId)) {
+          invoiceMap.set(invId, {
+            invoiceId: invId,
+            invoiceNumber: invNum,
+            payerId,
+            payerName,
+            issuedDate: issued,
+            daysSince,
+            autobill,
+            failedTx,
+            totalExpectedCents: 0,
+            totalPaidCents: 0,
+            totalOwedCents: 0,
+            lineItems: []
+          });
+        }
+        const inv = invoiceMap.get(invId);
+        inv.totalExpectedCents += expectedC;
+        inv.totalPaidCents += paidC;
+        inv.totalOwedCents += owedC;
+        inv.lineItems.push({ productName, productType, planId });
       }
 
-      // Phase 3: business-wide active plan set (NO person filter, KL #237)
-      const planAttrs = await queryV3('person_plans', {
-        page: { limit: 2000 },
-        fields: ['plan_id'],
-        filter: ['and', [
-          ['eq', 'is_canceled', 'f'],
-          ['eq', 'is_ended', 'f'],
-          ['eq', 'is_deactivated', 'f'],
-          ['eq', 'is_exhausted', 'f'],
-          ['ne', 'plan_type', 'late_cancellation_fee']
-        ]]
-      }, token);
-      const activePlanIds = new Set((planAttrs.rows || []).map(r => r[0]));
+      // Compute the 3-year cutoff once
+      const today = new Date();
+      const threeYearsAgo = new Date(today);
+      threeYearsAgo.setFullYear(threeYearsAgo.getFullYear() - 3);
+      const threeYearsAgoStr = threeYearsAgo.toISOString().slice(0, 10);
 
-      // Classify each invoice
+      // Phase 4: Annotate each invoice with recent-account-activity
+      // (whether the payer or any dependents has had visits or payments in
+      // the last 3 years). Used to promote old-bill cases from CLEANUP to
+      // COLLECT. Ported from cleanup tool v1.08.
+      const allInvoices = [...invoiceMap.values()];
+      const payerIds = [...new Set(allInvoices.map(i => i.payerId))];
+      const payerToDependents = new Map();
+      await runConcurrent(payerIds, 5, async (payerId) => {
+        try {
+          const resp = await fetch(`${BASE}/api/v2/desk/people/${payerId}`, {
+            credentials: 'include',
+            headers: { 'Accept': 'application/json' }
+          });
+          if (!resp.ok) {
+            payerToDependents.set(payerId, []);
+            return;
+          }
+          const json = await resp.json();
+          const person = json.people?.[0];
+          const depIds = (person?.dependents || []).map(d => d.id).filter(id => id != null);
+          payerToDependents.set(payerId, depIds);
+        } catch (e) {
+          payerToDependents.set(payerId, []);
+        }
+      });
+
+      const allRelevantIds = new Set();
+      for (const pid of payerIds) {
+        allRelevantIds.add(pid);
+        for (const depId of (payerToDependents.get(pid) || [])) {
+          allRelevantIds.add(depId);
+        }
+      }
+
+      const lastVisitByPerson = new Map();
+      const idArray = [...allRelevantIds];
+      const ID_CHUNK = 100;
+      for (let i = 0; i < idArray.length; i += ID_CHUNK) {
+        const chunk = idArray.slice(i, i + ID_CHUNK);
+        const clients = await queryV3('clients', {
+          page: { limit: 200 },
+          fields: ['person_id', 'last_visit_date'],
+          filter: ['or', chunk.map(id => ['eq', 'person_id', id])]
+        }, token);
+        for (const row of (clients.rows || [])) {
+          lastVisitByPerson.set(row[0], row[1]);
+        }
+      }
+
+      const payersWithRecentPayments = new Set();
+      for (let i = 0; i < payerIds.length; i += ID_CHUNK) {
+        const chunk = payerIds.slice(i, i + ID_CHUNK);
+        const txns = await queryV3('transactions', {
+          page: { limit: 200 },
+          fields: ['invoice_payer_id', 'transaction_date'],
+          filter: ['and', [
+            ['gt', 'transaction_date', threeYearsAgoStr],
+            ['or', chunk.map(id => ['eq', 'invoice_payer_id', id])]
+          ]]
+        }, token);
+        for (const row of (txns.rows || [])) {
+          payersWithRecentPayments.add(row[0]);
+        }
+      }
+
+      // Helper: does any line item have a covering plan?
+      // A plan covers if it was alive at issued_date AND ended within the
+      // last 3 years (or is still active / never ended).
+      function hasCoveringPlan(inv) {
+        return inv.lineItems.some(li => {
+          if (li.planId == null) return false;
+          const plan = planById.get(li.planId);
+          if (!plan) return false;
+          const end = plan[3];
+          if (end && end < inv.issuedDate) return false; // ended before invoice issued
+          if (end && end < threeYearsAgoStr) return false; // ended >3y ago
+          return true;
+        });
+      }
+
+      // Helper: does any line item lack a plan_id?
+      function hasNonPlanItem(inv) {
+        return inv.lineItems.some(li => li.planId == null);
+      }
+
+      // Helper: is the account active?
+      function isAccountActive(inv) {
+        const depIds = payerToDependents.get(inv.payerId) || [];
+        for (const id of [inv.payerId, ...depIds]) {
+          const lastVisit = lastVisitByPerson.get(id);
+          if (lastVisit && lastVisit >= threeYearsAgoStr) return true;
+        }
+        if (payersWithRecentPayments.has(inv.payerId)) return true;
+        return false;
+      }
+
+      // Phase 5: Classify each invoice
       const out = [];
-      for (const r of invRows) {
-        const [iid, iNum, payerName, payerId, issued, totalC, paidC, owedC, daysSince, autobill, failedTx] = r;
-        const linkedPlans = invToPlans.get(iid) || [];
-        const hasActivePlan = linkedPlans.some(p => activePlanIds.has(p));
-        const hasPayment = paidC > 0;
+      for (const inv of allInvoices) {
+        const covered = hasCoveringPlan(inv);
+        const hasPayment = inv.totalPaidCents > 0;
+        const isActive = isAccountActive(inv);
+        const nonPlan = hasNonPlanItem(inv);
 
-        let cls, rec;
-        if (hasActivePlan && hasPayment && owedC > 0) {
-          cls = 'COLLECT (partial)';
-          rec = `Partial paid ($${(paidC/100).toFixed(2)} of $${(totalC/100).toFixed(2)}): collect $${(owedC/100).toFixed(2)} balance`;
-        } else if (hasActivePlan) {
+        let cls;
+        const modifiers = [];
+
+        // Classification logic (two-class with promotion):
+        // - covered AND no payment = COLLECT (fresh-billed, customer should pay)
+        // - covered AND partial payment = COLLECT + 'partial'
+        // - uncovered AND active = COLLECT + 'old bill' (promotion rule 1)
+        // - uncovered AND payment AND active = COLLECT + 'refund needed' + 'old bill' (promotion rule 2)
+        // - uncovered AND no payment AND not active = CLEANUP (true write-off)
+        // - uncovered AND payment AND not active = CLEANUP + 'refund needed'
+        if (covered) {
           cls = 'COLLECT';
-          if (autobill === 't' && failedTx >= 3) {
-            rec = `Auto-bill failed ${failedTx} times: update payment method or contact customer`;
-          } else if (autobill === 't' && failedTx > 0) {
-            rec = `Auto-bill failing (${failedTx} attempts): monitor`;
-          } else if (autobill === 't') {
+          if (hasPayment && inv.totalOwedCents > 0) modifiers.push('partial');
+        } else if (isActive) {
+          cls = 'COLLECT';
+          modifiers.push('old bill');
+          if (hasPayment) modifiers.push('refund needed');
+        } else if (hasPayment) {
+          cls = 'CLEANUP';
+          modifiers.push('refund needed');
+        } else {
+          cls = 'CLEANUP';
+        }
+
+        if (nonPlan) modifiers.push('non-plan');
+
+        // Build recommendation text
+        let rec;
+        if (cls === 'COLLECT') {
+          if (modifiers.includes('refund needed')) {
+            rec = `Refund $${(inv.totalPaidCents/100).toFixed(2)} first, then collect $${(inv.totalOwedCents/100).toFixed(2)} balance`;
+          } else if (modifiers.includes('partial')) {
+            rec = `Partial paid ($${(inv.totalPaidCents/100).toFixed(2)} of $${(inv.totalExpectedCents/100).toFixed(2)}): collect $${(inv.totalOwedCents/100).toFixed(2)} balance`;
+          } else if (modifiers.includes('old bill')) {
+            rec = `Old bill (${fmtDuration(inv.daysSince)}), customer still active: gentle follow-up`;
+          } else if (inv.autobill === 't' && inv.failedTx >= 3) {
+            rec = `Auto-bill failed ${inv.failedTx} times: update payment method or contact customer`;
+          } else if (inv.autobill === 't' && inv.failedTx > 0) {
+            rec = `Auto-bill failing (${inv.failedTx} attempts): monitor`;
+          } else if (inv.autobill === 't') {
             rec = `Auto-bill pending: will retry`;
           } else {
             rec = `Manual bill: send payment reminder`;
           }
-        } else if (hasPayment) {
-          cls = 'CLEANUP (refund)';
-          rec = `Refund $${(paidC/100).toFixed(2)} (paid by customer), then cancel`;
         } else {
-          cls = 'CLEANUP';
-          rec = daysSince < 365 ? `Orphan (${fmtDuration(daysSince)}): verify before cancelling` : `Stale orphan (${fmtDuration(daysSince)}): safe to cancel`;
+          if (modifiers.includes('refund needed')) {
+            rec = `Refund $${(inv.totalPaidCents/100).toFixed(2)} (paid by customer), then cancel`;
+          } else {
+            rec = `Stale orphan (${fmtDuration(inv.daysSince)}): safe to cancel`;
+          }
         }
 
         out.push([
-          cls,                              // 0  status
-          iNum,                             // 1  invoice number
-          iid,                              // 2  invoice id (hidden, for link)
-          payerName,                        // 3  payer name
-          payerId,                          // 4  payer id (hidden, for link)
-          owedC,                            // 5  outstanding cents
-          totalC,                           // 6  expected cents (hidden)
-          paidC,                            // 7  net paid cents (hidden)
-          daysSince,                        // 8  days past due
-          issued,                           // 9  issued date (hidden)
-          autobill === 't' ? 'yes' : 'no',  // 10 autobill
-          failedTx,                         // 11 failed_transactions
-          rec                               // 12 recommendation
+          cls,                                    // 0  status
+          inv.invoiceNumber,                      // 1  invoice number
+          inv.invoiceId,                          // 2  invoice id (hidden, for link)
+          inv.payerName,                          // 3  payer name
+          inv.payerId,                            // 4  payer id (hidden, for link)
+          inv.totalOwedCents,                     // 5  outstanding cents
+          inv.totalExpectedCents,                 // 6  expected cents (hidden)
+          inv.totalPaidCents,                     // 7  net paid cents (hidden)
+          inv.daysSince,                          // 8  days past due
+          inv.issuedDate,                         // 9  issued date (hidden)
+          inv.autobill === 't' ? 'yes' : 'no',    // 10 autobill
+          inv.failedTx,                           // 11 failed_transactions
+          rec,                                    // 12 recommendation
+          modifiers                               // 13 modifiers array
         ]);
       }
 
@@ -382,22 +574,18 @@ let panelX = Math.max(60, window.innerWidth - 1020);
 let panelY = 60;
 let dragOffset = null;
 
-// Date range state (ISO strings, active values used by getFilter closures)
 let dateStart, dateEnd;
 const savedDates = {};
 REPORTS.forEach(r => {
   if (r.defaultDates) savedDates[r.id] = r.defaultDates();
 });
-// Initialize from first report's defaults
 const _initDates = savedDates[REPORTS[0].id] || { start: '', end: '' };
 dateStart = _initDates.start;
 dateEnd = _initDates.end;
 
-// Per-report email (initialize from report defaults)
 const savedEmails = {};
 REPORTS.forEach(r => { savedEmails[r.id] = r.defaultEmail || ''; });
 
-// Per-report "Include summary" checkbox state, defaults to false
 const savedExplain = {};
 REPORTS.forEach(r => { savedExplain[r.id] = false; });
 
@@ -414,7 +602,7 @@ async function getAuthToken() {
     throw new Error('Network error fetching /desk/reports. Are you online?');
   }
   if (resp.status === 404) {
-    throw new Error('Page /desk/reports not found. Make sure you\'re on the Pike13 desk (try navigating to ' + BASE + '/desk first).');
+    throw new Error('Page /desk/reports not found. Make sure you are on the Pike13 desk (try navigating to ' + BASE + '/desk first).');
   }
   if (resp.status === 401 || resp.status === 403) {
     throw new Error('Not authorized. Please log into the Pike13 desk first.');
@@ -423,7 +611,6 @@ async function getAuthToken() {
     throw new Error('/desk/reports returned HTTP ' + resp.status + '. Try refreshing your Pike13 login.');
   }
   const html = await resp.text();
-  // Check if we got redirected to a login page
   if (html.includes('sign_in') || html.includes('Log in') || html.includes('login')) {
     throw new Error('Session expired. Please log into the Pike13 desk and try again.');
   }
@@ -456,11 +643,9 @@ async function queryV3(slug, attributes, token) {
 
 async function fetchReport(token) {
   const rpt = report();
-  // Custom fetch hook for reports that need multi-phase queries / client-side joins
   if (rpt.customFetch) {
     return await rpt.customFetch(token, queryV3);
   }
-  // Default single-query path
   const attrs = await queryV3(rpt.slug, {
     page: { limit: 500 },
     fields: rpt.fields,
@@ -500,11 +685,6 @@ function fmtCellPlain(r, col) {
   return String(val);
 }
 
-// Used by buildHtmlTable for clipboard output. Same as fmtCellPlain but
-// preserves links on columns that define a `link` callback. Does NOT invoke
-// the `render` callbacks (which produce panel-internal HTML with CSS classes
-// that won't carry over to email/Canvas destinations); instead it prefers
-// `renderPlain` when available, falling back to the val-based formatters.
 function fmtCellClipboardHtml(r, col) {
   if (col.renderPlain) return esc(col.renderPlain(r));
   const val = r[col.idx];
@@ -520,9 +700,6 @@ function fmtCellClipboardHtml(r, col) {
 
 // ===================== CLIPBOARD / EMAIL =====================
 
-// Render a structured explanation blocks array as HTML (<p>, <ul><li>) for
-// the clipboard output. Each format builder reads the same blocks and emits
-// its own format-appropriate markup.
 function renderExplanationAsHtml(blocks) {
   if (!Array.isArray(blocks) || blocks.length === 0) return '';
   let html = '';
@@ -543,9 +720,6 @@ function renderExplanationAsHtml(blocks) {
   return html;
 }
 
-// Render the same blocks as plain text for clipboard and Slack-mrkdwn outputs.
-// Paragraphs are joined by blank lines, lists are rendered with a bullet
-// character followed by each item on its own line underneath an optional intro.
 function renderExplanationAsPlainText(blocks) {
   if (!Array.isArray(blocks) || blocks.length === 0) return '';
   const parts = [];
@@ -555,7 +729,7 @@ function renderExplanationAsPlainText(blocks) {
     } else if (b.type === 'list') {
       let s = '';
       if (b.intro) s += b.intro + '\n';
-      s += b.items.map(i => '• ' + i).join('\n');
+      s += b.items.map(i => '* ' + i).join('\n');
       parts.push(s);
     }
   }
@@ -565,9 +739,6 @@ function renderExplanationAsPlainText(blocks) {
 function buildHtmlTable() {
   const rpt = report();
   let html = `<p style="margin:0 0 8px;font-family:Arial,sans-serif;font-size:14px;font-weight:bold;">${esc(rpt.emailSubject())}</p>`;
-  // Optional summary preamble (toggled by the "Include summary" checkbox).
-  // Rendered as real <p> and <ul><li> elements so it renders as a proper
-  // formatted document in email / Canvas / any rich-text destination.
   if (savedExplain[currentReportId] && rpt.buildExplanation) {
     html += renderExplanationAsHtml(rpt.buildExplanation());
   }
@@ -605,16 +776,10 @@ function buildPlainTable() {
 }
 
 function buildSlackTable() {
-  // Produces a Slack-friendly message: bold title + row count + a triple-backtick
-  // code block with column-aligned monospace text. Slack renders code blocks in
-  // a fixed-width font, which is the only way to get tabular data to display as
-  // a grid in a Slack message (regular HTML tables get stripped on paste).
   const rpt = report();
   if (rows.length === 0) return '';
-  const ELLIPSIS = '…';
+  const ELLIPSIS = '...';
 
-  // Extract plain-text cell values, stripping any residual HTML and
-  // applying per-column slackMax truncation.
   const cells = rows.map(r => rpt.columns.map(c => {
     let val = fmtCellPlain(r, c);
     val = val.replace(/<[^>]+>/g, '');
@@ -625,14 +790,12 @@ function buildSlackTable() {
   }));
   const headers = rpt.columns.map(c => c.label);
 
-  // Auto-size each column to the widest of its header and all cells.
   const widths = headers.map((h, i) => {
     let w = h.length;
     for (const row of cells) w = Math.max(w, row[i].length);
     return w;
   });
 
-  // Alignment: right-align numeric/currency, center-align center cols, left-align rest.
   const align = (text, width, col) => {
     if (col.format === 'currency' || col.align === 'right') return text.padStart(width);
     if (col.align === 'center') {
@@ -644,7 +807,7 @@ function buildSlackTable() {
   };
 
   const headerRow = headers.map((h, i) => align(h, widths[i], rpt.columns[i])).join('  ');
-  const sep = widths.map(w => '─'.repeat(w)).join('  ');
+  const sep = widths.map(w => '-'.repeat(w)).join('  ');
   const dataRows = cells.map(row =>
     row.map((cell, i) => align(cell, widths[i], rpt.columns[i])).join('  ')
   );
@@ -652,9 +815,6 @@ function buildSlackTable() {
   const title = rpt.emailSubject();
   const noun = rpt.rowNoun || 'row';
   const countLine = `_${rows.length} ${noun}${rows.length !== 1 ? 's' : ''}_`;
-  // Optional summary preamble placed ABOVE the code block as Slack message
-  // text. Slack wraps message paragraphs naturally; placing the prose inside
-  // the code block would force monospace, which makes long lines wrap badly.
   let preamble = '';
   if (savedExplain[currentReportId] && rpt.buildExplanation) {
     const ex = renderExplanationAsPlainText(rpt.buildExplanation());
@@ -687,7 +847,7 @@ async function copyTableToClipboard() {
 }
 
 async function copyForSlack() {
-  if (rows.length === 0) { showToast('⚠ Nothing to copy'); return; }
+  if (rows.length === 0) { showToast('Nothing to copy'); return; }
   const text = buildSlackTable();
   try {
     await navigator.clipboard.writeText(text);
@@ -701,14 +861,11 @@ async function copyForSlack() {
     ta.remove();
   }
   const charCount = text.length.toLocaleString();
-  // Slack's per-message compose limit is 4,000 characters. Messages over this
-  // can't be sent; Slack shows an overflow badge in the compose box. v1.6 had
-  // this set to 12000 which never fired in the danger zone.
   const overLimit = text.length > 4000;
   if (overLimit) {
-    showToast(`⚠ Copied ${charCount} chars, which exceeds Slack's 4,000-char message limit. Use 📋 HTML and paste into a Slack Canvas instead for tables this large.`, true);
+    showToast(`Copied ${charCount} chars, which exceeds Slack's 4,000-char message limit. Use HTML and paste into a Slack Canvas instead for tables this large.`, true);
   } else {
-    showToast(`✓ Copied for Slack. Paste into Slack message (${charCount} chars)`);
+    showToast(`Copied for Slack. Paste into Slack message (${charCount} chars)`);
   }
 }
 
@@ -717,7 +874,7 @@ function showToast(msg, persistent) {
   const el = document.createElement('div');
   el.className = 'toast' + (persistent ? ' persistent' : '');
   el.innerHTML = persistent
-    ? `${msg} <span class="toast-dismiss" style="margin-left:12px;cursor:pointer;opacity:0.6">✕</span>`
+    ? `${msg} <span class="toast-dismiss" style="margin-left:12px;cursor:pointer;opacity:0.6">x</span>`
     : msg;
   shadow.appendChild(el);
   if (persistent) {
@@ -731,21 +888,20 @@ async function emailReport() {
   const emailInput = shadow.querySelector('#rpt-email');
   const email = emailInput ? emailInput.value.trim() : '';
   if (!email) {
-    showToast('⚠ Enter a recipient email first');
+    showToast('Enter a recipient email first');
     emailInput?.focus();
     return;
   }
   const ok = await copyTableToClipboard();
-  if (!ok) { showToast('⚠ Clipboard copy failed'); return; }
+  if (!ok) { showToast('Clipboard copy failed'); return; }
   const subject = encodeURIComponent(report().emailSubject());
   window.open(`https://webmail.musicplace.com/?_task=mail&_action=compose&_to=${encodeURIComponent(email)}&_subject=${subject}`, '_blank');
-  showToast('✓ Table copied. Ctrl+V to paste into email body', true);
+  showToast('Table copied. Ctrl+V to paste into email body', true);
 }
 
 // ===================== RENDER =====================
 
 function renderPanel(status) {
-  // Preserve date inputs across re-renders (email is saved in event handlers)
   const startEl = shadow.querySelector('#rpt-date-start');
   const endEl = shadow.querySelector('#rpt-date-end');
   if (startEl) dateStart = startEl.value;
@@ -755,13 +911,11 @@ function renderPanel(status) {
   const pillBadge = rows.length > 0 ? ` (${rows.length})` : '';
   const tags = rpt.filterTags ? rpt.filterTags() : [];
 
-  // Build table headers
   const thHtml = rpt.columns.map(c => {
     const style = c.align ? ` style="text-align:${c.align}"` : '';
     return `<th${style}>${c.label}</th>`;
   }).join('');
 
-  // Build table rows
   const trHtml = rows.map(r => {
     const tds = rpt.columns.map(c => {
       const val = r[c.idx];
@@ -772,7 +926,6 @@ function renderPanel(status) {
     return `<tr>${tds}</tr>`;
   }).join('');
 
-  // Report selector options
   const optionsHtml = REPORTS.map(r =>
     `<option value="${r.id}" ${r.id === currentReportId ? 'selected' : ''}>${r.name}</option>`
   ).join('');
@@ -783,7 +936,7 @@ function renderPanel(status) {
   :host { all:initial; }
   .panel {
     position:fixed; top:${panelY}px; left:${panelX}px;
-    width:${isMinimized ? 'auto' : '960px'}; max-height:${isMinimized ? 'none' : '80vh'};
+    width:${isMinimized ? 'auto' : '1020px'}; max-height:${isMinimized ? 'none' : '80vh'};
     background:#ffffff; border-radius:${isMinimized ? '20px' : '12px'};
     color:#111827;
     font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
@@ -956,10 +1109,21 @@ function renderPanel(status) {
     white-space:nowrap;
     border:1.5px solid transparent;
   }
-  .cls-collect         { background:#f0fdf4; color:#059669; border-color:#86efac; }
-  .cls-collect-partial { background:#fffbeb; color:#92400e; border-color:#fcd34d; }
-  .cls-cleanup         { background:#eff6ff; color:#1d4ed8; border-color:#bfdbfe; }
-  .cls-cleanup-refund  { background:#fee2e2; color:#b91c1c; border-color:#fca5a5; }
+  .cls-collect { background:#f0fdf4; color:#059669; border-color:#86efac; }
+  .cls-cleanup { background:#eff6ff; color:#1d4ed8; border-color:#bfdbfe; }
+
+  .mod {
+    display:inline-block;
+    padding:2px 6px; border-radius:4px;
+    font-size:9px; font-weight:700; letter-spacing:0.2px;
+    text-transform:uppercase;
+    margin-right:3px; white-space:nowrap;
+    border:1px solid transparent;
+  }
+  .mod-partial       { background:#fffbeb; color:#92400e; border-color:#fcd34d; }
+  .mod-old-bill      { background:#f5f3ff; color:#6d28d9; border-color:#ddd6fe; }
+  .mod-refund-needed { background:#fee2e2; color:#b91c1c; border-color:#fca5a5; }
+  .mod-non-plan      { background:#fef3c7; color:#92400e; border-color:#fcd34d; }
 
   .warn {
     color:#92400e; font-size:12px; font-weight:600;
@@ -1013,7 +1177,7 @@ function renderPanel(status) {
   ${isMinimized ? '' : `
   <div class="toolbar">
     <button class="btn btn-pri" id="btn-copy" ${rows.length === 0 ? 'disabled' : ''} title="Copy as HTML table. Paste into email or any rich-text destination.">📋 HTML</button>
-    <button class="btn btn-pri" id="btn-copy-slack" ${rows.length === 0 ? 'disabled' : ''} title="Copy as Slack mrkdwn with monospace code block. Paste into a Slack message. Best for short tables under 4,000 characters; wide tables (like Unpaid Invoice Triage) will not fit and will not render correctly. Use 📋 HTML and paste into a Slack Canvas instead for those.">💬 Slack</button>
+    <button class="btn btn-pri" id="btn-copy-slack" ${rows.length === 0 ? 'disabled' : ''} title="Copy as Slack mrkdwn with monospace code block. Paste into a Slack message. Best for short tables under 4,000 characters; wide tables (like Unpaid Invoice Triage) will not fit and will not render correctly. Use HTML and paste into a Slack Canvas instead for those.">💬 Slack</button>
     ${rpt.buildExplanation ? `
     <label class="checkbox-label" title="Prepend a category breakdown / totals to the copied output">
       <input type="checkbox" id="rpt-include-explain" ${savedExplain[currentReportId] ? 'checked' : ''} />
@@ -1042,11 +1206,11 @@ function renderPanel(status) {
     ${status === 'loading' ? `
       <div class="status-msg"><div class="spinner"></div><br>${rpt.loadingMsg}</div>
     ` : status && status.message ? `
-      <div class="status-msg" style="color:#b91c1c;">⚠ ${status.message}</div>
+      <div class="status-msg" style="color:#b91c1c;">${status.message}</div>
     ` : rows.length === 0 ? `
       <div class="status-msg">${rpt.emptyMsg}</div>
     ` : `
-      ${rows._hasMore ? '<div class="warn">⚠ More than 500 results. Only first 500 shown.</div>' : ''}
+      ${rows._hasMore ? '<div class="warn">More than 500 results. Only first 500 shown.</div>' : ''}
       <table>
         <thead><tr>${thHtml}</tr></thead>
         <tbody>${trHtml}</tbody>
@@ -1056,13 +1220,12 @@ function renderPanel(status) {
   `}
 </div>`;
 
-  // --- Wire events ---
   shadow.getElementById('btn-close')?.addEventListener('click', () => host.remove());
   shadow.getElementById('btn-min')?.addEventListener('click', () => { isMinimized = !isMinimized; renderPanel(); });
   shadow.getElementById('btn-email')?.addEventListener('click', emailReport);
   shadow.getElementById('btn-copy')?.addEventListener('click', async () => {
     await copyTableToClipboard();
-    showToast('✓ HTML table copied. Paste into email or rich-text');
+    showToast('HTML table copied. Paste into email or rich-text');
   });
   shadow.getElementById('btn-copy-slack')?.addEventListener('click', copyForSlack);
   shadow.getElementById('rpt-include-explain')?.addEventListener('change', e => {
@@ -1082,20 +1245,17 @@ function renderPanel(status) {
     loadReport();
   });
   shadow.getElementById('rpt-select')?.addEventListener('change', e => {
-    // Preserve inputs before switching
     const emailEl = shadow.querySelector('#rpt-email');
     if (emailEl) savedEmails[currentReportId] = emailEl.value;
     const sEl = shadow.querySelector('#rpt-date-start');
     const eEl = shadow.querySelector('#rpt-date-end');
     if (sEl && eEl) savedDates[currentReportId] = { start: sEl.value, end: eEl.value };
-    // Switch report and restore its dates
     currentReportId = e.target.value;
     const dates = savedDates[currentReportId];
     if (dates) { dateStart = dates.start; dateEnd = dates.end; }
     loadReport();
   });
 
-  // --- Dragging ---
   const handle = shadow.getElementById('drag-handle');
   handle?.addEventListener('mousedown', e => {
     if (e.target.tagName === 'BUTTON' || e.target.tagName === 'SELECT') return;
@@ -1131,7 +1291,6 @@ async function loadReport() {
   }
 }
 
-// --- Boot ---
 renderPanel('loading');
 loadReport();
 console.log(`Pike13 Reports v${VERSION} loaded successfully`);
