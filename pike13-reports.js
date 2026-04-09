@@ -1,9 +1,9 @@
-// Pike13 Reports v1.12 - UIT classifier rebuilt: plan_id join, 3-year cutoff, account-activity check, two-class flattening with separate Modifiers column
+// Pike13 Reports v1.13 - Add Last Activity / Activity Type columns to UIT, sortable headers on all reports, remove Slack button
 (function() {
 'use strict';
 
 const PANEL_ID = 'pike13-reports';
-const VERSION = '1.12';
+const VERSION = '1.13';
 const BUILD_DATE = '2026-04-08';
 const SUBDOMAIN = location.hostname.split('.')[0];
 const BASE = location.origin;
@@ -71,6 +71,26 @@ function fmtDuration(days) {
 
 function clsSlug(s) {
   return 'cls-' + String(s).toLowerCase().replace(/[^a-z]+/g, '-').replace(/^-|-$/g, '');
+}
+
+// Generic comparator for sorting rows by a column. Handles numbers,
+// nulls (always sorted last regardless of direction), strings (case-insensitive),
+// arrays (compared by joined string), and dates (string-comparable in ISO format).
+function compareForSort(av, bv, dir) {
+  const aNull = av == null || av === '';
+  const bNull = bv == null || bv === '';
+  if (aNull && bNull) return 0;
+  if (aNull) return 1;  // nulls always last
+  if (bNull) return -1;
+  let cmp;
+  if (typeof av === 'number' && typeof bv === 'number') {
+    cmp = av - bv;
+  } else if (Array.isArray(av) && Array.isArray(bv)) {
+    cmp = av.join(',').localeCompare(bv.join(','));
+  } else {
+    cmp = String(av).toLowerCase().localeCompare(String(bv).toLowerCase());
+  }
+  return dir === 'desc' ? -cmp : cmp;
 }
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -288,6 +308,8 @@ const REPORTS = [
       { label: 'Invoice',        idx: 1, link: r => `${BASE}/invoices/${r[2]}` },
       { label: 'Owed',           idx: 5, format: 'currency', align: 'right' },
       { label: 'Past Due',       idx: 8, align: 'center', render: r => fmtDuration(r[8]), renderPlain: r => fmtDuration(r[8]) },
+      { label: 'Last Activity',  idx: 14, align: 'center', render: r => r[14] ? fmtDate(r[14]) : '<span style="color:#cbd5e1;">never</span>', renderPlain: r => r[14] ? fmtDate(r[14]) : 'never' },
+      { label: 'Activity Type',  idx: 15, align: 'center', render: r => r[15] ? `<span style="color:#6b7280;font-size:11px;">${esc(r[15])}</span>` : '<span style="color:#cbd5e1;">-</span>', renderPlain: r => r[15] || '' },
       { label: 'Autobill',       idx: 10, align: 'center' },
       { label: 'Fails',          idx: 11, align: 'center', render: r => {
         const v = r[11];
@@ -422,7 +444,7 @@ const REPORTS = [
         }
       }
 
-      const payersWithRecentPayments = new Set();
+      const lastPaymentByPayer = new Map(); // payer_id -> latest transaction_date string
       for (let i = 0; i < payerIds.length; i += ID_CHUNK) {
         const chunk = payerIds.slice(i, i + ID_CHUNK);
         const txns = await queryV3('transactions', {
@@ -434,7 +456,10 @@ const REPORTS = [
           ]]
         }, token);
         for (const row of (txns.rows || [])) {
-          payersWithRecentPayments.add(row[0]);
+          const payerId = row[0], date = row[1];
+          if (!date) continue;
+          const existing = lastPaymentByPayer.get(payerId);
+          if (!existing || date > existing) lastPaymentByPayer.set(payerId, date);
         }
       }
 
@@ -458,15 +483,34 @@ const REPORTS = [
         return inv.lineItems.some(li => li.planId == null);
       }
 
-      // Helper: is the account active?
-      function isAccountActive(inv) {
+      // Helper: collect activity info for an account.
+      // Returns { active, lastDate, type } where:
+      //   - active is a boolean (true if any visit or payment in last 3 years)
+      //   - lastDate is the most recent activity date string (or null)
+      //   - type is one of 'visit', 'payment', 'visit + payment', or null
+      // Visits are checked across the payer and all dependents; payments are
+      // checked on the payer only (since transactions are scoped by payer_id).
+      function getAccountActivity(inv) {
         const depIds = payerToDependents.get(inv.payerId) || [];
+        let lastVisitDate = null;
         for (const id of [inv.payerId, ...depIds]) {
-          const lastVisit = lastVisitByPerson.get(id);
-          if (lastVisit && lastVisit >= threeYearsAgoStr) return true;
+          const lv = lastVisitByPerson.get(id);
+          if (lv && lv >= threeYearsAgoStr) {
+            if (!lastVisitDate || lv > lastVisitDate) lastVisitDate = lv;
+          }
         }
-        if (payersWithRecentPayments.has(inv.payerId)) return true;
-        return false;
+        const lastPaymentDate = lastPaymentByPayer.get(inv.payerId) || null;
+        const hasVisit = lastVisitDate != null;
+        const hasPayment = lastPaymentDate != null;
+        let lastDate = null;
+        if (hasVisit && hasPayment) lastDate = lastVisitDate > lastPaymentDate ? lastVisitDate : lastPaymentDate;
+        else if (hasVisit) lastDate = lastVisitDate;
+        else if (hasPayment) lastDate = lastPaymentDate;
+        let type = null;
+        if (hasVisit && hasPayment) type = 'visit + payment';
+        else if (hasVisit) type = 'visit';
+        else if (hasPayment) type = 'payment';
+        return { active: hasVisit || hasPayment, lastDate, type };
       }
 
       // Phase 5: Classify each invoice
@@ -474,7 +518,8 @@ const REPORTS = [
       for (const inv of allInvoices) {
         const covered = hasCoveringPlan(inv);
         const hasPayment = inv.totalPaidCents > 0;
-        const isActive = isAccountActive(inv);
+        const activity = getAccountActivity(inv);
+        const isActive = activity.active;
         const nonPlan = hasNonPlanItem(inv);
 
         let cls;
@@ -543,11 +588,14 @@ const REPORTS = [
           inv.autobill === 't' ? 'yes' : 'no',    // 10 autobill
           inv.failedTx,                           // 11 failed_transactions
           rec,                                    // 12 recommendation
-          modifiers                               // 13 modifiers array
+          modifiers,                              // 13 modifiers array
+          activity.lastDate,                      // 14 last activity date (or null)
+          activity.type                           // 15 activity type (or null)
         ]);
       }
 
-      // Sort by Owed descending (collections opportunities first)
+      // Default sort: Owed descending. Users can override via column header
+      // clicks (the savedSort state takes precedence at render time).
       out.sort((a, b) => b[5] - a[5]);
       return { rows: out, totalCount: out.length, hasMore: false };
     }
@@ -589,7 +637,26 @@ REPORTS.forEach(r => { savedEmails[r.id] = r.defaultEmail || ''; });
 const savedExplain = {};
 REPORTS.forEach(r => { savedExplain[r.id] = false; });
 
+// Per-report sort state. Each entry is { col: <index>, dir: 'asc'|'desc' }
+// or null for "use the report's default sort". Persists across refresh
+// within the session and resets when the bookmarklet is closed.
+const savedSort = {};
+REPORTS.forEach(r => { savedSort[r.id] = null; });
+
 function report() { return REPORTS.find(r => r.id === currentReportId); }
+
+// Returns the current rows in their user-sorted order if a sort is active,
+// or in their underlying order otherwise. Used by both the panel renderer
+// and the HTML/plain-text table builders so that copy output matches what
+// is on screen.
+function getSortedRows() {
+  const sortState = savedSort[currentReportId];
+  if (!sortState) return rows;
+  const rpt = report();
+  const col = rpt.columns[sortState.colIdx];
+  if (!col) return rows;
+  return [...rows].sort((a, b) => compareForSort(a[col.idx], b[col.idx], sortState.dir));
+}
 
 // ===================== AUTH =====================
 
@@ -749,7 +816,7 @@ function buildHtmlTable() {
     html += `<td${align}>${col.label}</td>`;
   }
   html += `</tr>`;
-  for (const r of rows) {
+  for (const r of getSortedRows()) {
     html += `<tr>`;
     for (const col of rpt.columns) {
       const align = col.align ? ` style="text-align:${col.align}"` : '';
@@ -769,58 +836,10 @@ function buildPlainTable() {
     if (ex) txt += ex + '\n\n';
   }
   txt += rpt.columns.map(c => c.label).join('\t') + '\n';
-  for (const r of rows) {
+  for (const r of getSortedRows()) {
     txt += rpt.columns.map(c => fmtCellPlain(r, c)).join('\t') + '\n';
   }
   return txt;
-}
-
-function buildSlackTable() {
-  const rpt = report();
-  if (rows.length === 0) return '';
-  const ELLIPSIS = '...';
-
-  const cells = rows.map(r => rpt.columns.map(c => {
-    let val = fmtCellPlain(r, c);
-    val = val.replace(/<[^>]+>/g, '');
-    if (c.slackMax && val.length > c.slackMax) {
-      val = val.slice(0, c.slackMax - 1) + ELLIPSIS;
-    }
-    return val;
-  }));
-  const headers = rpt.columns.map(c => c.label);
-
-  const widths = headers.map((h, i) => {
-    let w = h.length;
-    for (const row of cells) w = Math.max(w, row[i].length);
-    return w;
-  });
-
-  const align = (text, width, col) => {
-    if (col.format === 'currency' || col.align === 'right') return text.padStart(width);
-    if (col.align === 'center') {
-      const pad = width - text.length;
-      const left = Math.floor(pad / 2);
-      return ' '.repeat(left) + text + ' '.repeat(pad - left);
-    }
-    return text.padEnd(width);
-  };
-
-  const headerRow = headers.map((h, i) => align(h, widths[i], rpt.columns[i])).join('  ');
-  const sep = widths.map(w => '-'.repeat(w)).join('  ');
-  const dataRows = cells.map(row =>
-    row.map((cell, i) => align(cell, widths[i], rpt.columns[i])).join('  ')
-  );
-
-  const title = rpt.emailSubject();
-  const noun = rpt.rowNoun || 'row';
-  const countLine = `_${rows.length} ${noun}${rows.length !== 1 ? 's' : ''}_`;
-  let preamble = '';
-  if (savedExplain[currentReportId] && rpt.buildExplanation) {
-    const ex = renderExplanationAsPlainText(rpt.buildExplanation());
-    if (ex) preamble = '\n\n' + ex;
-  }
-  return `*${title}*\n${countLine}${preamble}\n\n\`\`\`\n${headerRow}\n${sep}\n${dataRows.join('\n')}\n\`\`\``;
 }
 
 async function copyTableToClipboard() {
@@ -843,29 +862,6 @@ async function copyTableToClipboard() {
     document.execCommand('copy');
     ta.remove();
     return true;
-  }
-}
-
-async function copyForSlack() {
-  if (rows.length === 0) { showToast('Nothing to copy'); return; }
-  const text = buildSlackTable();
-  try {
-    await navigator.clipboard.writeText(text);
-  } catch (e) {
-    console.warn('Slack clipboard write failed, falling back:', e);
-    const ta = document.createElement('textarea');
-    ta.value = text;
-    document.body.appendChild(ta);
-    ta.select();
-    document.execCommand('copy');
-    ta.remove();
-  }
-  const charCount = text.length.toLocaleString();
-  const overLimit = text.length > 4000;
-  if (overLimit) {
-    showToast(`Copied ${charCount} chars, which exceeds Slack's 4,000-char message limit. Use HTML and paste into a Slack Canvas instead for tables this large.`, true);
-  } else {
-    showToast(`Copied for Slack. Paste into Slack message (${charCount} chars)`);
   }
 }
 
@@ -910,13 +906,18 @@ function renderPanel(status) {
   const rpt = report();
   const pillBadge = rows.length > 0 ? ` (${rows.length})` : '';
   const tags = rpt.filterTags ? rpt.filterTags() : [];
+  const sortState = savedSort[currentReportId];
+  const sortedRows = getSortedRows();
 
-  const thHtml = rpt.columns.map(c => {
+  const thHtml = rpt.columns.map((c, i) => {
     const style = c.align ? ` style="text-align:${c.align}"` : '';
-    return `<th${style}>${c.label}</th>`;
+    const isActive = sortState && sortState.colIdx === i;
+    const arrow = isActive ? (sortState.dir === 'asc' ? ' ▲' : ' ▼') : '';
+    const cls = isActive ? ' class="sortable active"' : ' class="sortable"';
+    return `<th${cls}${style} data-col-idx="${i}">${c.label}${arrow}</th>`;
   }).join('');
 
-  const trHtml = rows.map(r => {
+  const trHtml = sortedRows.map(r => {
     const tds = rpt.columns.map(c => {
       const val = r[c.idx];
       const isZero = c.align === 'center' && (val === 0 || val === '0');
@@ -1089,6 +1090,9 @@ function renderPanel(status) {
     border-bottom:2px solid #e5e7eb;
     white-space:nowrap;
   }
+  th.sortable { cursor:pointer; user-select:none; transition:background 0.1s, color 0.1s; }
+  th.sortable:hover { background:#eff6ff; color:#2563eb; }
+  th.sortable.active { color:#2563eb; background:#eff6ff; }
   td {
     padding:8px 10px;
     border-bottom:1px solid #f3f4f6;
@@ -1177,7 +1181,6 @@ function renderPanel(status) {
   ${isMinimized ? '' : `
   <div class="toolbar">
     <button class="btn btn-pri" id="btn-copy" ${rows.length === 0 ? 'disabled' : ''} title="Copy as HTML table. Paste into email or any rich-text destination.">📋 HTML</button>
-    <button class="btn btn-pri" id="btn-copy-slack" ${rows.length === 0 ? 'disabled' : ''} title="Copy as Slack mrkdwn with monospace code block. Paste into a Slack message. Best for short tables under 4,000 characters; wide tables (like Unpaid Invoice Triage) will not fit and will not render correctly. Use HTML and paste into a Slack Canvas instead for those.">💬 Slack</button>
     ${rpt.buildExplanation ? `
     <label class="checkbox-label" title="Prepend a category breakdown / totals to the copied output">
       <input type="checkbox" id="rpt-include-explain" ${savedExplain[currentReportId] ? 'checked' : ''} />
@@ -1227,7 +1230,6 @@ function renderPanel(status) {
     await copyTableToClipboard();
     showToast('HTML table copied. Paste into email or rich-text');
   });
-  shadow.getElementById('btn-copy-slack')?.addEventListener('click', copyForSlack);
   shadow.getElementById('rpt-include-explain')?.addEventListener('change', e => {
     savedExplain[currentReportId] = e.target.checked;
   });
@@ -1254,6 +1256,26 @@ function renderPanel(status) {
     const dates = savedDates[currentReportId];
     if (dates) { dateStart = dates.start; dateEnd = dates.end; }
     loadReport();
+  });
+
+  // Sortable column headers. Click toggles between ascending, descending,
+  // and unsorted (which restores the report's default sort). State is saved
+  // per report so switching reports remembers each one's last sort.
+  shadow.querySelectorAll('th.sortable').forEach(th => {
+    th.addEventListener('click', () => {
+      const colIdx = parseInt(th.dataset.colIdx, 10);
+      const cur = savedSort[currentReportId];
+      let next;
+      if (!cur || cur.colIdx !== colIdx) {
+        next = { colIdx, dir: 'asc' };
+      } else if (cur.dir === 'asc') {
+        next = { colIdx, dir: 'desc' };
+      } else {
+        next = null; // third click returns to default
+      }
+      savedSort[currentReportId] = next;
+      renderPanel();
+    });
   });
 
   const handle = shadow.getElementById('drag-handle');
